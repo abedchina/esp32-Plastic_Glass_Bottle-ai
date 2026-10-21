@@ -8,7 +8,12 @@ import cv2
 import numpy as np
 
 from flask import Flask, request, jsonify, Response
-from ultralytics import YOLO
+
+# Light TFLite runtime: no PyTorch, so the server fits in Render's free 512MB RAM
+try:
+    from ai_edge_litert.interpreter import Interpreter
+except ImportError:
+    from tensorflow.lite.python.interpreter import Interpreter
 
 
 # =========================================
@@ -67,15 +72,94 @@ latest_result = {
 
 
 # =========================================
-# LOAD ULTRALYTICS MODEL
+# LOAD YOLO TFLITE MODEL
 # =========================================
+
+class LiteYOLO:
+    """YOLOv8 TFLite detector with numpy pre/post-processing.
+
+    Gives the same boxes as Ultralytics: letterbox to the model size,
+    then confidence filter and per-class NMS.
+    """
+
+    def __init__(self, path):
+        self.interpreter = Interpreter(model_path=path, num_threads=2)
+        self.interpreter.allocate_tensors()
+        self.input = self.interpreter.get_input_details()[0]
+        self.output = self.interpreter.get_output_details()[0]
+        self.size = int(self.input["shape"][1])
+
+    def predict(self, bgr, conf, iou, classes):
+        h, w = bgr.shape[:2]
+        size = self.size
+
+        # Letterbox: keep aspect ratio, pad with grey (114)
+        r = min(size / h, size / w)
+        nh, nw = int(round(h * r)), int(round(w * r))
+        top, left = (size - nh) // 2, (size - nw) // 2
+
+        canvas = np.full((size, size, 3), 114, np.uint8)
+        canvas[top:top + nh, left:left + nw] = cv2.resize(
+            bgr, (nw, nh), interpolation=cv2.INTER_LINEAR
+        )
+
+        x = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        x = x.astype(np.float32)[None] / 255.0
+
+        self.interpreter.set_tensor(self.input["index"], x)
+        self.interpreter.invoke()
+
+        # (1, 4 + classes, 8400) -> (8400, 4 + classes)
+        pred = self.interpreter.get_tensor(self.output["index"])[0].T
+        boxes, scores = pred[:, :4], pred[:, 4:]
+
+        # TFLite export gives 0..1 coordinates
+        if boxes.max() <= 2.0:
+            boxes = boxes * size
+
+        class_ids = scores.argmax(1)
+        confidences = scores[np.arange(len(class_ids)), class_ids]
+
+        keep = (confidences >= conf) & np.isin(class_ids, classes)
+        boxes = boxes[keep]
+        confidences = confidences[keep]
+        class_ids = class_ids[keep]
+
+        if not len(confidences):
+            return []
+
+        # center xywh -> corners, back to original image pixels
+        x1 = (boxes[:, 0] - boxes[:, 2] / 2 - left) / r
+        y1 = (boxes[:, 1] - boxes[:, 3] / 2 - top) / r
+        x2 = (boxes[:, 0] + boxes[:, 2] / 2 - left) / r
+        y2 = (boxes[:, 1] + boxes[:, 3] / 2 - top) / r
+
+        rects = [
+            [float(a), float(b), float(c - a), float(d - b)]
+            for a, b, c, d in zip(x1, y1, x2, y2)
+        ]
+
+        picked = cv2.dnn.NMSBoxesBatched(
+            rects,
+            confidences.tolist(),
+            class_ids.tolist(),
+            conf,
+            iou
+        )
+
+        return [
+            (
+                int(class_ids[i]),
+                float(confidences[i]),
+                (x1[i], y1[i], x2[i], y2[i])
+            )
+            for i in np.array(picked).flatten()
+        ]
+
 
 print("Loading YOLO TFLite model...", flush=True)
 
-model = YOLO(
-    MODEL_PATH,
-    task="detect"
-)
+model = LiteYOLO(MODEL_PATH)
 
 print("YOLO model initialized!", flush=True)
 
@@ -109,7 +193,7 @@ def auth():
 
 
 # =========================================
-# DETECT BOTTLES USING ULTRALYTICS
+# DETECT BOTTLES
 # =========================================
 
 def detect_bottles(frame):
@@ -131,64 +215,44 @@ def detect_bottles(frame):
 
     # Same YOLO detection method as PC
     with model_lock:
-        result = model.predict(
-            source=roi_image,
+        found = model.predict(
+            roi_image,
             conf=CONF_THRESHOLD,
             iou=IOU_THRESHOLD,
-            classes=SELECTED_CLASS_IDS,
-            imgsz=640,
-            verbose=False
-        )[0]
+            classes=SELECTED_CLASS_IDS
+        )
 
     detections = []
 
-    if result.boxes is not None:
+    for class_id, confidence, bounds in found:
 
-        coordinates = result.boxes.xyxy.cpu().numpy()
-        class_ids = result.boxes.cls.cpu().numpy().astype(int)
-        confidences = result.boxes.conf.cpu().numpy()
+        label = CLASS_NAMES.get(class_id, "unknown")
 
-        for bounds, class_id, confidence in zip(
-            coordinates,
-            class_ids,
-            confidences
-        ):
+        x1, y1, x2, y2 = map(int, bounds)
 
-            if class_id not in SELECTED_CLASS_IDS:
-                continue
+        # Convert ROI coordinates to full frame
+        x1 += rx1
+        x2 += rx1
+        y1 += ry1
+        y2 += ry1
 
-            label = CLASS_NAMES.get(
-                int(class_id),
-                "unknown"
-            )
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
 
-            x1, y1, x2, y2 = map(int, bounds)
+        x2 = max(0, min(width, x2))
+        y2 = max(0, min(height, y2))
 
-            # Convert ROI coordinates to full frame
-            x1 += rx1
-            x2 += rx1
-            y1 += ry1
-            y2 += ry1
+        if x2 <= x1 or y2 <= y1:
+            continue
 
-            x1 = max(0, min(width - 1, x1))
-            y1 = max(0, min(height - 1, y1))
-
-            x2 = max(0, min(width, x2))
-            y2 = max(0, min(height, y2))
-
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            detections.append({
-                "class": label,
-                "confidence": round(
-                    float(confidence), 3
-                ),
-                "x": x1,
-                "y": y1,
-                "w": x2 - x1,
-                "h": y2 - y1
-            })
+        detections.append({
+            "class": label,
+            "confidence": round(confidence, 3),
+            "x": x1,
+            "y": y1,
+            "w": x2 - x1,
+            "h": y2 - y1
+        })
 
     detections.sort(
         key=lambda item: item["confidence"],
@@ -623,7 +687,19 @@ async function detectLoop(mySession) {
                 body: form
             });
 
-            const data = await response.json();
+            let data;
+
+            try {
+                data = await response.json();
+            } catch {
+                // Render sends an HTML page while the server wakes up or restarts
+                detections = [];
+                detectionTime = 0;
+                $("status").textContent =
+                    "Server is starting... retrying (" + response.status + ")";
+                await sleep(2000);
+                continue;
+            }
 
             if (!running || session !== mySession) {
                 break;
@@ -729,7 +805,7 @@ def home():
     return jsonify({
         "status": "online",
         "model": "waste_final_v1.tflite",
-        "engine": "Ultralytics YOLO",
+        "engine": "YOLO TFLite (LiteRT)",
         "camera": "/camera"
     })
 
@@ -811,7 +887,7 @@ def detect():
 def status():
     return jsonify({
         "status": "online",
-        "engine": "Ultralytics YOLO",
+        "engine": "YOLO TFLite (LiteRT)",
         "model": "waste_final_v1.tflite",
         "allowed_classes": [
             "plastic",

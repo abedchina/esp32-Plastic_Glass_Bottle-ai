@@ -14,7 +14,7 @@ app = Flask(__name__)
 # SETTINGS
 # =====================================
 
-MODEL_PATH = "model.tflite"
+MODEL_PATH = "waste_final_v1.tflite"
 
 CLASS_NAMES = ["plastic", "glass"]
 CONF_THRESHOLD = 0.65

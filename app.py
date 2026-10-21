@@ -46,7 +46,7 @@ SELECTED_CLASS_IDS = [
     if name in ALLOWED_CLASSES
 ]
 
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.5"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.65"))
 MIN_CONF, MAX_CONF = 0.2, 0.95   # range allowed from the sensitivity slider
 IOU_THRESHOLD = 0.45
 
@@ -451,8 +451,8 @@ select {
         <select id="cameraSelect" aria-label="Camera"></select>
         <button id="restart">Restart camera</button>
         <label>Sensitivity
-            <input id="sens" type="range" min="20" max="90" value="50">
-            <b id="sensVal">50%</b>
+            <input id="sens" type="range" min="20" max="90" value="65">
+            <b id="sensVal">65%</b>
         </label>
     </div>
 
@@ -583,12 +583,12 @@ async function startCamera() {
     $("warn").textContent = "";
 
     try {
-        // higher resolution = sharper image for the AI
+        // same 640x480 framing the sorting zone was tuned for
         const videoConstraints = cameraId
             ? {deviceId: {exact: cameraId}}
             : {facingMode: {ideal: "environment"}};
-        videoConstraints.width = {ideal: 1280};
-        videoConstraints.height = {ideal: 720};
+        videoConstraints.width = {ideal: 640};
+        videoConstraints.height = {ideal: 480};
 
         stream = await navigator.mediaDevices.getUserMedia({
             video: videoConstraints,
@@ -879,9 +879,16 @@ async function detectLoop(mySession) {
             if (detections.length) {
                 const best = detections[0];
 
+                // also show the other material's best score, so close calls are visible
+                const other = detections.find(d => d.class !== best.class);
+
                 $("result").textContent =
                     best.class.toUpperCase() + " - " +
-                    Math.round(best.confidence * 100) + "%";
+                    Math.round(best.confidence * 100) + "%" +
+                    (other
+                        ? "  (" + other.class + " " +
+                          Math.round(other.confidence * 100) + "%)"
+                        : "");
 
             } else {
                 $("result").textContent =

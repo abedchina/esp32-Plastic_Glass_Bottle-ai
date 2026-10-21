@@ -6,451 +6,299 @@ import threading
 
 import cv2
 import numpy as np
+
 from flask import Flask, request, jsonify, Response
-from ai_edge_litert.interpreter import Interpreter
+from ultralytics import YOLO
+
+
+# =========================================
+# SETTINGS
+# =========================================
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODEL_PATH = os.path.join(
-    os.path.dirname(__file__),
-    'waste_final_v1.tflite'
+    BASE_DIR,
+    "waste_final_v1.tflite"
 )
 
-CLASS_NAMES = ['plastic', 'paper', 'metal', 'glass']
-ALLOWED_CLASSES = {'plastic', 'glass'}
+# Original class order
+CLASS_NAMES = {
+    0: "plastic",
+    1: "paper",
+    2: "metal",
+    3: "glass"
+}
+
+# Detect ONLY plastic and glass
+ALLOWED_CLASSES = {"plastic", "glass"}
+
+SELECTED_CLASS_IDS = [
+    i for i, name in CLASS_NAMES.items()
+    if name in ALLOWED_CLASSES
+]
 
 CONF_THRESHOLD = 0.65
-NMS_THRESHOLD = 0.45
+IOU_THRESHOLD = 0.45
 
-# Same sorting area as the original PC code
-ARRIVAL_ROI = (0.25, 0.208333, 0.78125, 0.875)
+# Same sorting zone as the PC project
+ARRIVAL_ROI = (
+    0.25,
+    0.208333,
+    0.78125,
+    0.875
+)
 
-DEVICE_TOKEN = os.getenv('DEVICE_TOKEN', '')
+DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
 
 model_lock = threading.Lock()
 result_lock = threading.Lock()
 
 latest_result = {
-    'detected': False,
-    'class': 'none',
-    'confidence': 0.0,
-    'boxes': [],
-    'timestamp': 0
+    "detected": False,
+    "class": "none",
+    "confidence": 0.0,
+    "boxes": [],
+    "timestamp": 0
 }
 
-# ==========================================
-# LOAD MODEL
-# ==========================================
 
-interpreter = Interpreter(
-    model_path=MODEL_PATH,
-    num_threads=2
+# =========================================
+# LOAD ULTRALYTICS MODEL
+# =========================================
+
+print("Loading YOLO TFLite model...", flush=True)
+
+model = YOLO(
+    MODEL_PATH,
+    task="detect"
 )
 
-interpreter.allocate_tensors()
-
-input_info = interpreter.get_input_details()[0]
-output_info = interpreter.get_output_details()[0]
-
-print(
-    'MODEL LOADED',
-    input_info['shape'],
-    output_info['shape'],
-    flush=True
-)
+print("YOLO model initialized!", flush=True)
 
 
-# ==========================================
+# =========================================
 # AUTHENTICATION
-# ==========================================
+# =========================================
 
 def authorized():
-    value = request.headers.get('X-Device-Token', '')
+    token = request.headers.get(
+        "X-Device-Token", ""
+    )
 
     return (
         bool(DEVICE_TOKEN)
-        and hmac.compare_digest(value, DEVICE_TOKEN)
+        and hmac.compare_digest(token, DEVICE_TOKEN)
     )
 
 
-# ==========================================
-# LETTERBOX PREPROCESSING
-# ==========================================
+@app.post("/auth")
+def auth():
+    if not authorized():
+        return jsonify({
+            "authorized": False,
+            "error": "Invalid token"
+        }), 401
 
-def letterbox(image, size):
-    """
-    Keep aspect ratio and add gray padding,
-    similar to Ultralytics YOLO.
-    """
-
-    src_h, src_w = image.shape[:2]
-    dst_w, dst_h = size
-
-    scale = min(
-        dst_w / src_w,
-        dst_h / src_h
-    )
-
-    resized_w = round(src_w * scale)
-    resized_h = round(src_h * scale)
-
-    dw = (dst_w - resized_w) / 2
-    dh = (dst_h - resized_h) / 2
-
-    image = cv2.resize(
-        image,
-        (resized_w, resized_h),
-        interpolation=cv2.INTER_LINEAR
-    )
-
-    top = round(dh - 0.1)
-    bottom = round(dh + 0.1)
-    left = round(dw - 0.1)
-    right = round(dw + 0.1)
-
-    image = cv2.copyMakeBorder(
-        image,
-        top,
-        bottom,
-        left,
-        right,
-        cv2.BORDER_CONSTANT,
-        value=(114, 114, 114)
-    )
-
-    return image, scale, left, top
+    return jsonify({
+        "authorized": True
+    })
 
 
-# ==========================================
-# DETECTION
-# ==========================================
+# =========================================
+# DETECT BOTTLES USING ULTRALYTICS
+# =========================================
 
-def detection_on_frame(frame):
+def detect_bottles(frame):
 
-    frame_h, frame_w = frame.shape[:2]
+    height, width = frame.shape[:2]
 
-    rx1 = int(ARRIVAL_ROI[0] * frame_w)
-    ry1 = int(ARRIVAL_ROI[1] * frame_h)
-    rx2 = int(ARRIVAL_ROI[2] * frame_w)
-    ry2 = int(ARRIVAL_ROI[3] * frame_h)
+    # Sorting zone from original PC code
+    left, top, right, bottom = ARRIVAL_ROI
 
-    crop = frame[ry1:ry2, rx1:rx2]
+    rx1 = int(left * width)
+    ry1 = int(top * height)
+    rx2 = int(right * width)
+    ry2 = int(bottom * height)
 
-    if crop.size == 0:
-        raise ValueError('ROI empty')
+    roi_image = frame[ry1:ry2, rx1:rx2].copy()
 
-    input_shape = input_info['shape']
+    if roi_image.size == 0:
+        raise ValueError("Invalid sorting zone")
 
-    mh = int(input_shape[1])
-    mw = int(input_shape[2])
-
-    image, ratio, pad_x, pad_y = letterbox(
-        crop,
-        (mw, mh)
-    )
-
-    image = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2RGB
-    )
-
-    dtype = input_info['dtype']
-
-    if np.issubdtype(dtype, np.floating):
-
-        tensor = image.astype(dtype) / 255.0
-
-    else:
-
-        scale, zero = input_info['quantization']
-
-        if scale <= 0:
-            raise ValueError(
-                'Unsupported input quantization'
-            )
-
-        tensor = np.rint(
-            (image.astype(np.float32) / 255.0)
-            / scale + zero
-        )
-
-        info = np.iinfo(dtype)
-
-        tensor = np.clip(
-            tensor,
-            info.min,
-            info.max
-        ).astype(dtype)
-
-    tensor = np.expand_dims(
-        tensor,
-        axis=0
-    )
-
-    # ======================================
-    # RUN TFLITE MODEL
-    # ======================================
-
+    # Same YOLO detection method as PC
     with model_lock:
+        result = model.predict(
+            source=roi_image,
+            conf=CONF_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            classes=SELECTED_CLASS_IDS,
+            imgsz=640,
+            verbose=False
+        )[0]
 
-        interpreter.set_tensor(
-            input_info['index'],
-            tensor
-        )
+    detections = []
 
-        interpreter.invoke()
+    if result.boxes is not None:
 
-        raw = interpreter.get_tensor(
-            output_info['index']
-        )
+        coordinates = result.boxes.xyxy.cpu().numpy()
+        class_ids = result.boxes.cls.cpu().numpy().astype(int)
+        confidences = result.boxes.conf.cpu().numpy()
 
-    scale, zero = output_info['quantization']
+        for bounds, class_id, confidence in zip(
+            coordinates,
+            class_ids,
+            confidences
+        ):
 
-    if scale > 0:
+            if class_id not in SELECTED_CLASS_IDS:
+                continue
 
-        raw = (
-            raw.astype(np.float32) - zero
-        ) * scale
-
-    predictions = np.squeeze(raw)
-
-    channels = 4 + len(CLASS_NAMES)
-
-    if predictions.ndim != 2:
-        raise ValueError(
-            'Unexpected output shape: {}'.format(
-                raw.shape
+            label = CLASS_NAMES.get(
+                int(class_id),
+                "unknown"
             )
-        )
 
-    if predictions.shape[0] == channels:
-        predictions = predictions.T
+            x1, y1, x2, y2 = map(int, bounds)
 
-    if predictions.shape[1] != channels:
-        raise ValueError(
-            'Expected {} channels but got {}'.format(
-                channels,
-                raw.shape
-            )
-        )
+            # Convert ROI coordinates to full frame
+            x1 += rx1
+            x2 += rx1
+            y1 += ry1
+            y2 += ry1
 
-    # ======================================
-    # FILTER PLASTIC AND GLASS
-    # ======================================
+            x1 = max(0, min(width - 1, x1))
+            y1 = max(0, min(height - 1, y1))
 
-    classes = predictions[:, 4:]
+            x2 = max(0, min(width, x2))
+            y2 = max(0, min(height, y2))
 
-    class_ids = np.argmax(
-        classes,
-        axis=1
-    )
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-    confidence = np.max(
-        classes,
-        axis=1
-    )
-
-    accepted_ids = [
-        i for i, name in enumerate(CLASS_NAMES)
-        if name in ALLOWED_CLASSES
-    ]
-
-    keep = (
-        (confidence >= CONF_THRESHOLD)
-        & np.isin(class_ids, accepted_ids)
-    )
-
-    selected = predictions[keep]
-    selected_class_ids = class_ids[keep]
-    selected_confidence = confidence[keep]
-
-    boxes = []
-    scores = []
-    ids = []
-
-    crop_h, crop_w = crop.shape[:2]
-
-    # ======================================
-    # CONVERT BOX COORDINATES
-    # ======================================
-
-    for prediction, cls_id, conf in zip(
-        selected,
-        selected_class_ids,
-        selected_confidence
-    ):
-
-        cx, cy, bw, bh = map(
-            float,
-            prediction[:4]
-        )
-
-        x1 = (cx - bw / 2 - pad_x) / ratio
-        y1 = (cy - bh / 2 - pad_y) / ratio
-
-        x2 = (cx + bw / 2 - pad_x) / ratio
-        y2 = (cy + bh / 2 - pad_y) / ratio
-
-        x1 = max(0, min(crop_w, x1))
-        y1 = max(0, min(crop_h, y1))
-
-        x2 = max(0, min(crop_w, x2))
-        y2 = max(0, min(crop_h, y2))
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        boxes.append([
-            int(x1 + rx1),
-            int(y1 + ry1),
-            int(x2 - x1),
-            int(y2 - y1)
-        ])
-
-        scores.append(float(conf))
-        ids.append(int(cls_id))
-
-    # ======================================
-    # NON MAXIMUM SUPPRESSION
-    # ======================================
-
-    objects = []
-
-    for cls_id in set(ids):
-
-        positions = [
-            i for i, c in enumerate(ids)
-            if c == cls_id
-        ]
-
-        grouped = [
-            boxes[i] for i in positions
-        ]
-
-        group_scores = [
-            scores[i] for i in positions
-        ]
-
-        indices = cv2.dnn.NMSBoxes(
-            grouped,
-            group_scores,
-            CONF_THRESHOLD,
-            NMS_THRESHOLD
-        )
-
-        for item in np.array(indices).reshape(-1):
-
-            j = positions[int(item)]
-
-            x, y, w, h = boxes[j]
-
-            objects.append({
-                'class': CLASS_NAMES[cls_id],
-                'confidence': round(scores[j], 3),
-                'x': x,
-                'y': y,
-                'w': w,
-                'h': h
+            detections.append({
+                "class": label,
+                "confidence": round(
+                    float(confidence), 3
+                ),
+                "x": x1,
+                "y": y1,
+                "w": x2 - x1,
+                "h": y2 - y1
             })
 
-    objects.sort(
-        key=lambda d: d['confidence'],
+    detections.sort(
+        key=lambda item: item["confidence"],
         reverse=True
     )
 
-    roi = [
+    sorting_zone = [
         rx1,
         ry1,
         rx2 - rx1,
         ry2 - ry1
     ]
 
-    return objects[:10], roi
+    return detections[:10], sorting_zone
 
 
-# ==========================================
+# =========================================
 # LIVE CAMERA WEBSITE
-# ==========================================
+# =========================================
 
 CAMERA_HTML = r"""
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 
 <head>
 <meta charset="UTF-8">
-
 <meta name="viewport"
-content="width=device-width,initial-scale=1">
+      content="width=device-width,initial-scale=1">
 
-<title>Plastic & Glass Bottle AI</title>
+<title>Plastic Glass Bottle AI</title>
 
 <style>
-
 * {
     box-sizing: border-box;
 }
 
 body {
-    background: #0f172a;
-    color: #fff;
-    text-align: center;
-    font-family: Arial, sans-serif;
     margin: 0;
     padding: 14px;
+    background: #0f172a;
+    color: white;
+    font-family: Arial, sans-serif;
+    text-align: center;
+}
+
+h2 {
+    margin: 12px 0;
 }
 
 #login {
-    max-width: 380px;
+    max-width: 400px;
     margin: 12vh auto;
-    background: #1e293b;
     padding: 24px;
-    border-radius: 14px;
-}
-
-input, button {
-    padding: 13px;
-    font-size: 17px;
-    border-radius: 8px;
-    border: 0;
-    margin: 8px 0;
+    background: #1e293b;
+    border-radius: 16px;
 }
 
 input {
     width: 100%;
+    padding: 14px;
+    border: 0;
+    border-radius: 8px;
+    font-size: 17px;
+    margin: 12px 0;
 }
 
 button {
+    padding: 13px 24px;
+    margin: 8px;
     background: #22c55e;
+    color: #08111e;
+    font-size: 16px;
     font-weight: bold;
-    cursor: pointer;
+    border: 0;
+    border-radius: 8px;
 }
 
-#camera {
+button:disabled {
+    opacity: 0.5;
+}
+
+#cameraPage {
     display: none;
 }
 
-canvas {
+#video {
+    display: none;
+}
+
+#canvas {
+    display: block;
     width: 100%;
     max-width: 720px;
     height: auto;
-    background: #000;
+    margin: 12px auto;
     border: 2px solid #22c55e;
-    border-radius: 10px;
-}
-
-video {
-    display: none;
-}
-
-#result {
-    font-size: 23px;
-    font-weight: bold;
-    color: #86efac;
+    border-radius: 12px;
+    background: black;
 }
 
 #status {
     color: #cbd5e1;
+    margin: 12px;
+}
+
+#result {
+    color: #86efac;
+    font-size: 23px;
+    font-weight: bold;
+    margin: 14px;
 }
 
 #error {
@@ -460,37 +308,31 @@ video {
 #enable {
     display: none;
 }
-
 </style>
-
 </head>
 
 <body>
 
 <div id="login">
-
     <h2>Plastic & Glass Bottle AI</h2>
 
-    <p>Enter password before opening the camera</p>
+    <p>Enter password to start</p>
 
     <input
         id="password"
         type="password"
         placeholder="Device Token"
-        autocomplete="off"
-    >
+        autocomplete="off">
 
     <button id="connect">
         Connect
     </button>
 
     <p id="error"></p>
-
 </div>
 
 
-<div id="camera">
-
+<div id="cameraPage">
     <h2>Live Bottle Detection</h2>
 
     <p id="status">Opening camera...</p>
@@ -499,12 +341,7 @@ video {
         Enable Camera
     </button>
 
-    <video
-        id="video"
-        autoplay
-        muted
-        playsinline>
-    </video>
+    <video id="video" autoplay muted playsinline></video>
 
     <canvas
         id="canvas"
@@ -512,166 +349,149 @@ video {
         height="480">
     </canvas>
 
-    <p id="result">
-        Waiting for AI...
-    </p>
+    <p id="result">Waiting for AI...</p>
 
     <button id="disconnect">
         Disconnect
     </button>
-
 </div>
 
 
 <script>
-
 const $ = id => document.getElementById(id);
 
-const video = $('video');
-const canvas = $('canvas');
+const video = $("video");
+const canvas = $("canvas");
+const ctx = canvas.getContext("2d");
 
-const ctx = canvas.getContext('2d');
-
-let token = '';
+let token = "";
 let stream = null;
 let running = false;
+let session = 0;
 
-let current = 0;
-let boxes = [];
+let detections = [];
 let roi = null;
-let updated = 0;
+let detectionTime = 0;
 
-const sleep = ms =>
-    new Promise(r => setTimeout(r, ms));
+const DETECTION_DELAY = 700;
+const BOX_MAX_AGE = 3000;
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 
-// ======================================
+// =====================================
 // LOGIN
-// ======================================
+// =====================================
 
-$('connect').onclick = async () => {
+$("connect").onclick = async function() {
 
-    const candidate = $('password').value.trim();
+    const candidate = $("password").value.trim();
 
     if (!candidate) {
-        $('error').textContent = 'Enter Device Token';
+        $("error").textContent = "Enter password";
         return;
     }
 
-    $('connect').disabled = true;
-
-    $('error').textContent = 'Checking password...';
+    $("connect").disabled = true;
+    $("error").textContent = "Checking password...";
 
     try {
-
-        const response = await fetch('/auth', {
-            method: 'POST',
+        const response = await fetch("/auth", {
+            method: "POST",
             headers: {
-                'X-Device-Token': candidate
+                "X-Device-Token": candidate
             }
         });
 
         if (!response.ok) {
-            $('error').textContent = 'Incorrect password';
+            $("error").textContent = "Incorrect password";
             return;
         }
 
         token = candidate;
+        $("password").value = "";
 
-        $('password').value = '';
-
-        $('login').style.display = 'none';
-        $('camera').style.display = 'block';
+        $("login").style.display = "none";
+        $("cameraPage").style.display = "block";
 
         await startCamera();
 
-    } catch (e) {
-
-        $('error').textContent =
-            'Connection problem: ' + e.message;
-
+    } catch (error) {
+        $("error").textContent =
+            "Connection error: " + error.message;
     } finally {
-
-        $('connect').disabled = false;
+        $("connect").disabled = false;
     }
 };
 
-
-$('password').addEventListener(
-    'keydown',
-    e => {
-        if (e.key === 'Enter') {
-            $('connect').click();
-        }
+$("password").addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+        $("connect").click();
     }
-);
+});
 
 
-// ======================================
-// START LIVE CAMERA
-// ======================================
+// =====================================
+// CAMERA
+// =====================================
 
 async function startCamera() {
 
     if (running) return;
 
-    try {
+    $("status").textContent = "Opening camera...";
 
+    try {
         stream = await navigator.mediaDevices.getUserMedia({
             video: {
-                facingMode: {
-                    ideal: 'environment'
-                },
-                width: {
-                    ideal: 640
-                },
-                height: {
-                    ideal: 480
-                }
+                facingMode: {ideal: "environment"},
+                width: {ideal: 640},
+                height: {ideal: 480}
             },
             audio: false
         });
 
         video.srcObject = stream;
-
         await video.play();
 
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
 
         running = true;
-        current++;
+        session++;
 
-        $('enable').style.display = 'none';
-        $('status').textContent = 'Live camera';
+        const mySession = session;
 
-        drawLoop(current);
-        detectLoop(current);
+        $("enable").style.display = "none";
+        $("status").textContent = "Camera LIVE";
 
-    } catch (e) {
+        drawLoop(mySession);
+        detectLoop(mySession);
 
-        $('status').textContent =
-            'Camera permission required: ' + e.message;
+    } catch (error) {
+        $("status").textContent =
+            "Camera error: " + error.message;
 
-        $('enable').style.display = 'inline-block';
+        $("enable").style.display = "inline-block";
     }
 }
 
-$('enable').onclick = startCamera;
+$("enable").onclick = startCamera;
 
 
-// ======================================
-// DRAW VIDEO + SORTING ZONE + BOXES
-// ======================================
+// =====================================
+// DRAW LIVE VIDEO AND BOXES
+// =====================================
 
-function drawLoop(id) {
+function drawLoop(mySession) {
 
-    if (!running || id !== current) {
+    if (!running || session !== mySession) {
         return;
     }
 
     if (video.readyState >= 2) {
-
         ctx.drawImage(
             video,
             0,
@@ -680,36 +500,33 @@ function drawLoop(id) {
             canvas.height
         );
 
-        // Sorting zone rectangle
+        // Sorting zone
         if (roi) {
-
-            ctx.strokeStyle = '#00d5ff';
+            ctx.strokeStyle = "#00d5ff";
             ctx.lineWidth = 2;
-
             ctx.strokeRect(...roi);
 
-            ctx.font = 'bold 14px Arial';
-            ctx.fillStyle = '#00d5ff';
+            ctx.fillStyle = "#00d5ff";
+            ctx.font = "bold 16px Arial";
 
             ctx.fillText(
-                'SORTING ZONE',
+                "SORTING ZONE",
                 roi[0],
-                Math.max(16, roi[1] - 7)
+                Math.max(18, roi[1] - 8)
             );
         }
 
-        // Detection boxes
-        if (Date.now() - updated < 2500) {
+        // Bounding boxes
+        if (Date.now() - detectionTime < BOX_MAX_AGE) {
 
-            for (const d of boxes) {
+            for (const d of detections) {
 
-                const color =
-                    d.class === 'plastic'
-                        ? '#22c55e'
-                        : '#ffad22';
+                const color = d.class === "plastic"
+                    ? "#22c55e"
+                    : "#ffad22";
 
-                ctx.lineWidth = 4;
                 ctx.strokeStyle = color;
+                ctx.lineWidth = 4;
 
                 ctx.strokeRect(
                     d.x,
@@ -719,70 +536,72 @@ function drawLoop(id) {
                 );
 
                 const label =
-                    d.class + ' ' +
-                    Math.round(d.confidence * 100) + '%';
+                    d.class.toUpperCase() + " " +
+                    Math.round(d.confidence * 100) + "%";
 
-                ctx.font = 'bold 17px Arial';
+                ctx.font = "bold 17px Arial";
 
-                const y = Math.max(23, d.y);
-
-                const tw =
+                const labelY = Math.max(25, d.y);
+                const textWidth =
                     ctx.measureText(label).width + 12;
 
                 ctx.fillStyle = color;
 
                 ctx.fillRect(
                     d.x,
-                    y - 23,
-                    tw,
-                    24
+                    labelY - 24,
+                    textWidth,
+                    25
                 );
 
-                ctx.fillStyle = '#111';
+                ctx.fillStyle = "#111111";
 
                 ctx.fillText(
                     label,
                     d.x + 6,
-                    y - 6
+                    labelY - 6
                 );
             }
         }
     }
 
-    requestAnimationFrame(
-        () => drawLoop(id)
-    );
+    requestAnimationFrame(() => drawLoop(mySession));
 }
 
 
-// ======================================
-// CONTINUOUS CLOUD DETECTION
-// ======================================
+// =====================================
+// CONTINUOUS CLOUD INFERENCE
+// =====================================
 
-async function detectLoop(id) {
+async function detectLoop(mySession) {
 
-    while (running && id === current) {
+    while (running && session === mySession) {
 
-        const shot = document.createElement('canvas');
+        if (video.readyState < 2) {
+            await sleep(300);
+            continue;
+        }
 
-        shot.width = canvas.width;
-        shot.height = canvas.height;
+        const capture = document.createElement("canvas");
 
-        shot.getContext('2d').drawImage(
+        capture.width = canvas.width;
+        capture.height = canvas.height;
+
+        capture.getContext("2d").drawImage(
             video,
             0,
             0,
-            shot.width,
-            shot.height
+            capture.width,
+            capture.height
         );
 
-        const blob = await new Promise(
-            r => shot.toBlob(
-                r,
-                'image/jpeg',
+        const blob = await new Promise(resolve => {
+            capture.toBlob(
+                resolve,
+                "image/jpeg",
                 0.65
-            )
-        );
+            );
+        });
 
         if (!blob) {
             await sleep(300);
@@ -790,133 +609,110 @@ async function detectLoop(id) {
         }
 
         const form = new FormData();
-
-        form.append(
-            'image',
-            blob,
-            'frame.jpg'
-        );
+        form.append("image", blob, "frame.jpg");
 
         try {
+            $("status").textContent =
+                "Camera LIVE - AI analyzing...";
 
-            $('status').textContent =
-                'Camera LIVE - analyzing...';
-
-            const resp = await fetch('/detect', {
-                method: 'POST',
+            const response = await fetch("/detect", {
+                method: "POST",
                 headers: {
-                    'X-Device-Token': token
+                    "X-Device-Token": token
                 },
                 body: form
             });
 
-            const data = await resp.json();
+            const data = await response.json();
 
-            if (!running || id !== current) {
+            if (!running || session !== mySession) {
                 break;
             }
 
-            if (resp.status === 401) {
-
-                stop();
-
-                $('error').textContent =
-                    'Incorrect or expired token';
-
+            if (response.status === 401) {
+                stopCamera();
+                $("error").textContent = "Invalid token";
                 break;
             }
 
-            if (!resp.ok) {
+            if (!response.ok) {
+                detections = [];
+                detectionTime = 0;
 
-                boxes = [];
+                $("status").textContent =
+                    data.error || "Detection failed";
 
-                $('status').textContent =
-                    data.error || ('Error ' + resp.status);
-
-                await sleep(1200);
+                await sleep(1500);
                 continue;
             }
 
-            boxes = data.boxes || [];
+            detections = data.boxes || [];
             roi = data.roi;
+            detectionTime = Date.now();
 
-            updated = Date.now();
+            if (detections.length) {
+                const best = detections[0];
 
-            if (boxes.length) {
-
-                $('result').textContent =
-                    boxes[0].class.toUpperCase()
-                    + ' - '
-                    + Math.round(
-                        boxes[0].confidence * 100
-                    )
-                    + '%';
+                $("result").textContent =
+                    best.class.toUpperCase() + " - " +
+                    Math.round(best.confidence * 100) + "%";
 
             } else {
-
-                $('result').textContent =
-                    'No plastic or glass detected';
+                $("result").textContent =
+                    "No plastic or glass detected";
             }
 
-            $('status').textContent =
-                'Camera LIVE - AI connected';
+            $("status").textContent =
+                "Camera LIVE - AI connected";
 
-        } catch (e) {
+        } catch (error) {
+            detections = [];
+            detectionTime = 0;
 
-            boxes = [];
-
-            $('status').textContent =
-                'Connection error: ' + e.message;
+            $("status").textContent =
+                "Network error: " + error.message;
         }
 
-        await sleep(700);
+        await sleep(DETECTION_DELAY);
     }
 }
 
 
-// ======================================
+// =====================================
 // DISCONNECT
-// ======================================
+// =====================================
 
-function stop() {
+function stopCamera() {
 
     running = false;
-    current++;
+    session++;
 
     if (stream) {
-
-        stream.getTracks().forEach(
-            t => t.stop()
-        );
-
+        stream.getTracks().forEach(track => track.stop());
         stream = null;
     }
 
     video.srcObject = null;
 
-    boxes = [];
+    detections = [];
     roi = null;
-    token = '';
+    token = "";
 
-    $('camera').style.display = 'none';
-    $('login').style.display = 'block';
-
-    $('password').value = '';
+    $("password").value = "";
+    $("cameraPage").style.display = "none";
+    $("login").style.display = "block";
 }
 
-$('disconnect').onclick = stop;
+$("disconnect").onclick = stopCamera;
 
-window.addEventListener(
-    'pagehide',
-    () => {
-        if (stream) {
-            stream.getTracks().forEach(
-                t => t.stop()
-            );
-        }
+window.addEventListener("pagehide", () => {
+    running = false;
+    session++;
+
+    if (stream) {
+        stream.getTracks().forEach(track => track.stop());
     }
-);
-
+});
 </script>
 
 </body>
@@ -924,108 +720,85 @@ window.addEventListener(
 """
 
 
-# ==========================================
-# FLASK ROUTES
-# ==========================================
+# =========================================
+# ROUTES
+# =========================================
 
-@app.get('/')
+@app.get("/")
 def home():
-
     return jsonify({
-        'status': 'online',
-        'camera': '/camera',
-        'model': 'waste_final_v1.tflite'
+        "status": "online",
+        "model": "waste_final_v1.tflite",
+        "engine": "Ultralytics YOLO",
+        "camera": "/camera"
     })
 
 
-@app.get('/camera')
+@app.get("/camera")
 def camera_page():
-
     return Response(
         CAMERA_HTML,
-        mimetype='text/html',
+        mimetype="text/html",
         headers={
-            'Cache-Control': 'no-store'
+            "Cache-Control": "no-store"
         }
     )
 
 
-@app.post('/auth')
-def auth():
-
-    if not authorized():
-
-        return jsonify({
-            'authorized': False
-        }), 401
-
-    return jsonify({
-        'authorized': True
-    })
-
-
-@app.post('/detect')
+@app.post("/detect")
 def detect():
-
     global latest_result
 
     if not authorized():
-
         return jsonify({
-            'error': 'Unauthorized'
+            "error": "Unauthorized"
         }), 401
 
-    picture = request.files.get('image')
+    uploaded = request.files.get("image")
 
-    if picture is None:
-
+    if uploaded is None:
         return jsonify({
-            'error': 'No image'
+            "error": "No image"
         }), 400
 
-    data = np.frombuffer(
-        picture.read(),
-        np.uint8
-    )
+    raw = uploaded.read()
 
-    frame = cv2.imdecode(
-        data,
+    if not raw:
+        return jsonify({
+            "error": "Empty image"
+        }), 400
+
+    image = cv2.imdecode(
+        np.frombuffer(raw, dtype=np.uint8),
         cv2.IMREAD_COLOR
     )
 
-    if frame is None:
-
+    if image is None:
         return jsonify({
-            'error': 'Invalid image'
+            "error": "Invalid image"
         }), 400
 
     try:
-
-        boxes, roi = detection_on_frame(frame)
+        boxes, roi = detect_bottles(image)
 
     except Exception:
-
-        app.logger.exception(
-            'Detection failed'
-        )
+        app.logger.exception("YOLO inference error")
 
         return jsonify({
-            'error': 'Detection failed - check Render Logs'
+            "error": "YOLO inference failed"
         }), 500
 
     best = boxes[0] if boxes else None
 
     result = {
-        'detected': bool(boxes),
-        'class': (
-            best['class'] if best else 'none'
+        "detected": bool(boxes),
+        "class": best["class"] if best else "none",
+        "confidence": (
+            best["confidence"] if best else 0.0
         ),
-        'confidence': (
-            best['confidence'] if best else 0.0
-        ),
-        'boxes': boxes,
-        'roi': roi,
-        'timestamp': time.time()
+        "boxes": boxes,
+        "roi": roi,
+        "timestamp": time.time()
     }
 
     with result_lock:
@@ -1034,52 +807,49 @@ def detect():
     return jsonify(result)
 
 
-@app.get('/status')
+@app.get("/status")
 def status():
-
     return jsonify({
-        'online': True,
-        'input_shape': input_info['shape'].tolist(),
-        'output_shape': output_info['shape'].tolist(),
-        'allowed_classes': [
-            'plastic',
-            'glass'
+        "status": "online",
+        "engine": "Ultralytics YOLO",
+        "model": "waste_final_v1.tflite",
+        "allowed_classes": [
+            "plastic",
+            "glass"
         ]
     })
 
 
-@app.get('/result')
+# Future ESP32 integration
+@app.get("/result")
 def get_result():
 
     if not authorized():
-
         return jsonify({
-            'error': 'Unauthorized'
+            "error": "Unauthorized"
         }), 401
 
     with result_lock:
-        data = latest_result.copy()
+        result = latest_result.copy()
 
-    if time.time() - data['timestamp'] > 3:
-
-        data.update({
-            'detected': False,
-            'class': 'none',
-            'confidence': 0.0,
-            'boxes': []
+    if time.time() - result["timestamp"] > 3:
+        result.update({
+            "detected": False,
+            "class": "none",
+            "confidence": 0.0,
+            "boxes": []
         })
 
-    return jsonify(data)
+    return jsonify(result)
 
 
-# ==========================================
-# RUN SERVER
-# ==========================================
+# =========================================
+# START
+# =========================================
 
-if __name__ == '__main__':
-
+if __name__ == "__main__":
     app.run(
-        host='0.0.0.0',
-        port=int(os.getenv('PORT', '10000')),
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "10000")),
         debug=False
     )

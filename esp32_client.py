@@ -1,49 +1,54 @@
-# MicroPython for ESP32: reads the bottle detection from the cloud server
-# and sorts each new item with a servo.
+# MicroPython for ESP32: gets the bottle detection from the cloud server.
 #
 # The phone/computer camera page (/camera) sends pictures to the server.
-# The ESP32 asks the server every half second: GET /result
-# (a home ESP32 can't receive calls from the cloud, so it asks instead).
+# The server counts ONE event per bottle: when a bottle enters the
+# SORTING ZONE it is counted once, and the next bottle counts only after
+# this one has left the zone (good for a moving conveyor).
+# The ESP32 asks the server every 0.3 s: GET /result
+#
+# LED on GPIO 2:  glass   = 3 fast blinks
+#                 plastic = 2 fast blinks
 
 import network
 import utime
 import urequests
 import gc
-from machine import Pin, PWM
+from machine import Pin
 
 SSID = 'your-wifi-name'
 PASSWORD = 'your-wifi-password'
 SERVER = 'https://esp32-plastic-glass-bottle-ai.onrender.com'
 DEVICE_TOKEN = 'your-device-token'   # same password as on the camera page
 
-POLL_MS = 500
-STABLE_POLLS = 3   # same material 3 times in a row (~1.5 s) = a real item
-EMPTY_POLLS = 2    # zone must be empty twice before the next item counts
+POLL_MS = 300
+BLINK_MS = 120
 
-led = Pin(2, Pin.OUT)            # built-in LED
-servo = PWM(Pin(18), freq=50)    # servo signal wire on GPIO 18
-
-
-def servo_angle(angle):
-    # 0.5 ms .. 2.5 ms pulse in a 20 ms period
-    servo.duty_u16(int(1638 + angle / 180 * (8192 - 1638)))
+led = Pin(2, Pin.OUT)
+led.off()
 
 
-def handle_arrival(label, confidence, count):
+def blink(times):
+    for _ in range(times):
+        led.on()
+        utime.sleep_ms(BLINK_MS)
+        led.off()
+        utime.sleep_ms(BLINK_MS)
+
+
+def handle_new_bottle(event):
+    label = event['class']
     print('========================')
-    print('Item #', count)
-    print('AI class:', label)
-    print('Confidence:', confidence)
-    led.on()
-    if label == 'plastic':
-        print('PLASTIC -> left bin')
-        servo_angle(30)
-    elif label == 'glass':
-        print('GLASS -> right bin')
-        servo_angle(150)
-    utime.sleep_ms(1000)
-    servo_angle(90)              # back to the middle
-    led.off()
+    print('NEW BOTTLE #', event['id'])
+    print('AI class:', label.upper())
+    print('Confidence: {}%'.format(round(event['confidence'] * 100)))
+    if label == 'glass':
+        print('GLASS -> LED 3 blinks')
+        blink(3)
+        # Add your glass motor/servo action here.
+    elif label == 'plastic':
+        print('PLASTIC -> LED 2 blinks')
+        blink(2)
+        # Add your plastic motor/servo action here.
     print('========================')
 
 
@@ -88,13 +93,9 @@ def get_result():
 
 def main():
     wlan = wifi_connect()
-    servo_angle(90)
-    candidate = None
-    same = 0
-    empty = 0
-    armed = True
-    total = 0
-    print('Waiting for detections...')
+    last_id = None          # last bottle the ESP32 already handled
+    last_state = None       # what was printed last, to avoid repeating lines
+    print('Waiting for bottles...')
 
     while True:
         if not wlan.isconnected():
@@ -102,25 +103,29 @@ def main():
 
         result = get_result()
         if result is not None:
-            label = result.get('class', 'none') if result.get('detected') else 'none'
+            event = result.get('event') or {}
+            event_id = event.get('id', 0)
 
-            if label not in ('plastic', 'glass'):
-                candidate = None
-                same = 0
-                empty += 1
-                if empty >= EMPTY_POLLS:
-                    armed = True
+            if last_id is None:
+                # first answer: handle only a bottle from the last 3 seconds
+                age = event.get('age')
+                fresh = event_id and age is not None and age < 3
+                last_id = event_id - 1 if fresh else event_id
+
+            if event_id and event_id != last_id:
+                last_id = event_id
+                handle_new_bottle(event)
+
+            # show what the camera sees now (printed only when it changes)
+            if result.get('detected'):
+                state = 'In zone: ' + result['class']
+                if not result.get('armed', True):
+                    state += ' (counted, waiting to leave)'
             else:
-                empty = 0
-                if label == candidate:
-                    same += 1
-                else:
-                    candidate = label
-                    same = 1
-                if armed and same >= STABLE_POLLS:
-                    armed = False
-                    total += 1
-                    handle_arrival(label, result.get('confidence', 0), total)
+                state = 'Zone empty'
+            if state != last_state:
+                print(state)
+                last_state = state
 
         utime.sleep_ms(POLL_MS)
 
@@ -129,5 +134,5 @@ if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        servo.deinit()
+        led.off()
         print('Stopped')

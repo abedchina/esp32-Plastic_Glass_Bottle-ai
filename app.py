@@ -63,6 +63,82 @@ DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
 model_lock = threading.Lock()
 result_lock = threading.Lock()
 
+
+# =========================================
+# ARRIVAL TRACKING (conveyor)
+# One event per bottle: the same material must be seen in a few
+# pictures in a row, then the zone must stay empty (the bottle left)
+# before the next bottle can count.
+# =========================================
+
+STABLE_FRAMES = 2       # same material in this many pictures in a row
+EMPTY_SECONDS = 1.5     # zone empty this long = the bottle has left
+MAX_SAMPLE_GAP = 4.0    # pictures further apart than this start over
+
+
+class ArrivalCycle:
+
+    def __init__(self):
+        self.armed = True
+        self.candidate = None
+        self.samples = 0
+        self.empty_since = None
+        self.last_sample = None
+
+    def update(self, label, now):
+        """label is 'plastic', 'glass' or None. Returns True for a new bottle."""
+
+        if (
+            self.last_sample is not None
+            and now - self.last_sample > MAX_SAMPLE_GAP
+        ):
+            self.candidate = None
+            self.samples = 0
+            self.empty_since = None
+
+        self.last_sample = now
+
+        if label is None:
+            self.candidate = None
+            self.samples = 0
+
+            if self.empty_since is None:
+                self.empty_since = now
+
+            if now - self.empty_since >= EMPTY_SECONDS:
+                self.armed = True
+
+            return False
+
+        self.empty_since = None
+
+        # Bottle already counted: wait until it leaves the zone
+        if not self.armed:
+            return False
+
+        if label == self.candidate:
+            self.samples += 1
+        else:
+            self.candidate = label
+            self.samples = 1
+
+        if self.samples >= STABLE_FRAMES:
+            self.armed = False
+            return True
+
+        return False
+
+
+cycle = ArrivalCycle()
+arrival_total = 0
+
+last_event = {
+    "id": 0,
+    "class": "none",
+    "confidence": 0.0,
+    "time": 0.0
+}
+
 latest_result = {
     "detected": False,
     "class": "none",
@@ -467,6 +543,7 @@ select {
     </canvas>
 
     <p id="result">Waiting for AI...</p>
+    <p id="arrival" style="font-size:18px;color:#93c5fd">Items counted: 0</p>
     <p style="color:#94a3b8;font-size:14px">Lower sensitivity % = detects more (also weak or blurry items). Keep the bottle inside SORTING ZONE.</p>
 
     <button id="disconnect">
@@ -876,6 +953,19 @@ async function detectLoop(mySession) {
             roi = data.roi;
             detectionTime = Date.now();
 
+            if (data.new_item) {
+                $("arrival").textContent =
+                    "NEW ITEM #" + data.arrival_total + ": " +
+                    data.event.class.toUpperCase();
+            } else if (data.armed === false) {
+                $("arrival").textContent =
+                    "Item #" + data.arrival_total + " (" + data.event.class +
+                    ") counted - waiting for it to leave the zone";
+            } else if (data.arrival_total !== undefined) {
+                $("arrival").textContent =
+                    "Zone ready - items counted: " + data.arrival_total;
+            }
+
             if (detections.length) {
                 const best = detections[0];
 
@@ -972,7 +1062,7 @@ def camera_page():
 
 @app.post("/detect")
 def detect():
-    global latest_result
+    global latest_result, arrival_total, last_event
 
     if not authorized():
         return jsonify({
@@ -1033,6 +1123,33 @@ def detect():
     }
 
     with result_lock:
+        new_item = cycle.update(
+            best["class"] if best else None,
+            result["timestamp"]
+        )
+
+        if new_item:
+            arrival_total += 1
+            last_event = {
+                "id": arrival_total,
+                "class": best["class"],
+                "confidence": best["confidence"],
+                "time": result["timestamp"]
+            }
+            print(
+                "NEW ITEM #{}: {} {:.0%}".format(
+                    arrival_total, best["class"], best["confidence"]
+                ),
+                flush=True
+            )
+
+        result.update({
+            "new_item": new_item,
+            "armed": cycle.armed,
+            "arrival_total": arrival_total,
+            "event": dict(last_event)
+        })
+
         latest_result = result
 
     return jsonify(result)
@@ -1051,7 +1168,8 @@ def status():
     })
 
 
-# Future ESP32 integration
+# ESP32 asks here: the current picture + the last counted bottle.
+# A new event "id" means a new bottle entered the sorting zone.
 @app.get("/result")
 def get_result():
 
@@ -1062,14 +1180,26 @@ def get_result():
 
     with result_lock:
         result = latest_result.copy()
+        result["event"] = dict(last_event)
+        result["armed"] = cycle.armed
+        result["arrival_total"] = arrival_total
 
-    if time.time() - result["timestamp"] > 3:
+    now = time.time()
+
+    if now - result["timestamp"] > 3:
         result.update({
             "detected": False,
             "class": "none",
             "confidence": 0.0,
             "boxes": []
         })
+
+    result.pop("roi", None)
+    result.pop("new_item", None)
+    result["event"]["age"] = (
+        round(now - result["event"]["time"], 1)
+        if result["event"]["id"] else None
+    )
 
     return jsonify(result)
 

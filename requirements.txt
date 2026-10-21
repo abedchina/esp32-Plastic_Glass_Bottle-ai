@@ -4,3 +4,4 @@ gunicorn>=23,<25
 numpy>=1.26,<3
 opencv-python-headless>=4.10,<5
 ai-edge-litert
+ultralytics

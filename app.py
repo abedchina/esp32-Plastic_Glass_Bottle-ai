@@ -7,63 +7,45 @@ import threading
 import cv2
 import numpy as np
 
-from flask import (
-    Flask,
-    request,
-    jsonify,
-    render_template_string
-)
-
+from flask import Flask, request, jsonify, render_template_string
 from ai_edge_litert.interpreter import Interpreter
 
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
-
 app = Flask(__name__)
-
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+
+# ==========================================
+# SETTINGS
+# ==========================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODEL_PATH = os.path.join(
-    BASE_DIR,
-    "waste_final_v1.tflite"
+    BASE_DIR, "waste_final_v1.tflite"
 )
 
-# IMPORTANT:
-# Must match your training class order.
-CLASS_NAMES = [
-    "plastic",
-    "paper",
-    "metal",
-    "glass"
-]
+# Match the model training order
+CLASS_NAMES = ["plastic", "paper", "metal", "glass"]
 
 CONF_THRESHOLD = 0.65
+NMS_THRESHOLD = 0.45
 
-DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
+DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "")
 
-RESULT_MAX_AGE = 5
-
-lock = threading.Lock()
 model_lock = threading.Lock()
 
 latest_result = {
     "detected": False,
     "class": "none",
     "confidence": 0.0,
-    "box": None,
+    "boxes": [],
     "timestamp": 0
 }
 
+result_lock = threading.Lock()
 
 # ==========================================
-# LOAD TFLITE MODEL
+# LOAD MODEL
 # ==========================================
-
-print("Loading TFLite model...", flush=True)
 
 interpreter = Interpreter(
     model_path=MODEL_PATH,
@@ -72,12 +54,12 @@ interpreter = Interpreter(
 
 interpreter.allocate_tensors()
 
-input_details = interpreter.get_input_details()[0]
-output_details = interpreter.get_output_details()[0]
+input_info = interpreter.get_input_details()[0]
+output_info = interpreter.get_output_details()[0]
 
-print("Model loaded!", flush=True)
-print("Input:", input_details["shape"], flush=True)
-print("Output:", output_details["shape"], flush=True)
+print("MODEL LOADED", flush=True)
+print("Input:", input_info["shape"], flush=True)
+print("Output:", output_info["shape"], flush=True)
 
 
 # ==========================================
@@ -85,85 +67,55 @@ print("Output:", output_details["shape"], flush=True)
 # ==========================================
 
 def authorized():
-    if not DEVICE_TOKEN:
-        return False
+    token = request.headers.get("X-Device-Token", "")
 
-    token = (
-        request.headers.get("X-Device-Token")
-        or request.form.get("token", "")
+    return bool(DEVICE_TOKEN) and hmac.compare_digest(
+        token, DEVICE_TOKEN
     )
-
-    return hmac.compare_digest(token, DEVICE_TOKEN)
 
 
 # ==========================================
-# IMAGE PREPROCESSING
+# DETECTION
 # ==========================================
 
-def preprocess(frame):
-    shape = input_details["shape"]
+def detect_objects(frame):
 
-    height = int(shape[1])
-    width = int(shape[2])
+    original_h, original_w = frame.shape[:2]
 
-    image = cv2.resize(
-        frame,
-        (width, height)
-    )
+    shape = input_info["shape"]
+    model_h = int(shape[1])
+    model_w = int(shape[2])
 
-    image = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2RGB
-    )
+    image = cv2.resize(frame, (model_w, model_h))
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    dtype = input_details["dtype"]
+    dtype = input_info["dtype"]
 
     if np.issubdtype(dtype, np.floating):
         tensor = image.astype(dtype) / 255.0
-
     else:
-        scale, zero = input_details["quantization"]
+        scale, zero = input_info["quantization"]
 
         if scale > 0:
             tensor = np.round(
                 (image.astype(np.float32) / 255.0)
                 / scale + zero
             )
-
             info = np.iinfo(dtype)
-
             tensor = np.clip(
-                tensor,
-                info.min,
-                info.max
+                tensor, info.min, info.max
             ).astype(dtype)
         else:
             tensor = image.astype(dtype)
 
-    return np.expand_dims(tensor, axis=0)
-
-
-# ==========================================
-# MODEL INFERENCE
-# ==========================================
-
-def detect(frame):
-
-    tensor = preprocess(frame)
+    tensor = np.expand_dims(tensor, axis=0)
 
     with model_lock:
-        interpreter.set_tensor(
-            input_details["index"],
-            tensor
-        )
-
+        interpreter.set_tensor(input_info["index"], tensor)
         interpreter.invoke()
+        output = interpreter.get_tensor(output_info["index"])
 
-        output = interpreter.get_tensor(
-            output_details["index"]
-        )
-
-    scale, zero = output_details["quantization"]
+    scale, zero = output_info["quantization"]
 
     if scale > 0:
         output = (
@@ -172,66 +124,101 @@ def detect(frame):
 
     predictions = np.squeeze(output)
 
-    if predictions.ndim != 2:
-        raise ValueError(
-            "Unsupported model output: "
-            + str(output.shape)
-        )
-
     channels = 4 + len(CLASS_NAMES)
 
-    # YOLOv8 output shape:
-    # [channels, boxes] or [boxes, channels]
+    if predictions.ndim != 2:
+        raise ValueError("Unsupported output shape")
+
     if predictions.shape[0] == channels:
         predictions = predictions.T
 
     if predictions.shape[1] != channels:
         raise ValueError(
-            "Model output does not match classes: "
-            + str(output.shape)
+            "Unexpected output: " + str(output.shape)
         )
 
-    scores = predictions[:, 4:]
+    boxes = []
+    confidences = []
+    class_ids = []
 
-    if scores.shape[0] == 0:
-        return "none", 0.0, None
+    scale_x = original_w / model_w
+    scale_y = original_h / model_h
 
-    best_classes = np.argmax(scores, axis=1)
-    best_scores = np.max(scores, axis=1)
+    for prediction in predictions:
 
-    index = int(np.argmax(best_scores))
-    confidence = float(best_scores[index])
+        scores = prediction[4:]
 
-    if confidence < CONF_THRESHOLD:
-        return "none", confidence, None
+        class_id = int(np.argmax(scores))
+        confidence = float(scores[class_id])
 
-    class_index = int(best_classes[index])
-    label = CLASS_NAMES[class_index]
+        if confidence < CONF_THRESHOLD:
+            continue
 
-    # Raw YOLO bounding box:
-    # center_x, center_y, width, height
-    box = predictions[index, :4].tolist()
+        cx, cy, w, h = prediction[:4]
 
-    return label, confidence, box
+        # Raw YOLOv8 coordinates in model pixels
+        x1 = int((cx - w / 2) * scale_x)
+        y1 = int((cy - h / 2) * scale_y)
+        x2 = int((cx + w / 2) * scale_x)
+        y2 = int((cy + h / 2) * scale_y)
+
+        x1 = max(0, min(x1, original_w - 1))
+        y1 = max(0, min(y1, original_h - 1))
+        x2 = max(0, min(x2, original_w))
+        y2 = max(0, min(y2, original_h))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        boxes.append([
+            x1, y1, x2 - x1, y2 - y1
+        ])
+
+        confidences.append(confidence)
+        class_ids.append(class_id)
+
+    # Non-Maximum Suppression, separately per class
+    detections = []
+
+    for class_id in sorted(set(class_ids)):
+        positions = [
+            i for i, c in enumerate(class_ids)
+            if c == class_id
+        ]
+
+        group_boxes = [boxes[i] for i in positions]
+        group_scores = [confidences[i] for i in positions]
+
+        indices = cv2.dnn.NMSBoxes(
+            group_boxes,
+            group_scores,
+            CONF_THRESHOLD,
+            NMS_THRESHOLD
+        )
+
+        for index in np.array(indices).reshape(-1):
+            i = positions[int(index)]
+            x, y, w, h = boxes[i]
+
+            detections.append({
+                "class": CLASS_NAMES[class_ids[i]],
+                "confidence": round(confidences[i], 3),
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h
+            })
+
+    detections.sort(
+        key=lambda d: d["confidence"],
+        reverse=True
+    )
+
+    return detections[:10]
 
 
 # ==========================================
-# HOME PAGE
-# ==========================================
-
-@app.get("/")
-def home():
-    return jsonify({
-        "status": "online",
-        "service": "Plastic Glass Bottle AI",
-        "model": "waste_final_v1.tflite",
-        "camera_page": "/camera",
-        "result_api": "/result"
-    })
-
-
-# ==========================================
-# CAMERA PAGE
+# LIVE CAMERA WEB PAGE
 # ==========================================
 
 CAMERA_HTML = """
@@ -239,105 +226,287 @@ CAMERA_HTML = """
 <html>
 <head>
 <meta name="viewport"
-      content="width=device-width, initial-scale=1">
+ content="width=device-width, initial-scale=1">
 
-<title>Bottle AI Camera</title>
+<title>Bottle AI Live Detection</title>
 
 <style>
 body {
+    margin: 0;
+    padding: 16px;
+    background: #101827;
+    color: white;
     font-family: Arial, sans-serif;
     text-align: center;
-    padding: 20px;
-    background: #f5f5f5;
+}
+
+h2 { margin-bottom: 8px; }
+
+canvas {
+    width: 100%;
+    max-width: 640px;
+    border: 2px solid #22c55e;
+    border-radius: 12px;
+    background: black;
 }
 
 input, button {
-    margin: 12px;
     padding: 12px;
-    font-size: 16px;
-    max-width: 95%;
+    margin: 6px;
+    border-radius: 8px;
+    font-size: 15px;
 }
 
 button {
-    background: #166b45;
-    color: white;
+    background: #22c55e;
     border: none;
-    border-radius: 8px;
+    font-weight: bold;
 }
 
-pre {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    text-align: left;
+#status {
+    margin: 14px;
+    color: #cbd5e1;
 }
+
+#result {
+    font-size: 20px;
+    font-weight: bold;
+    color: #86efac;
+}
+
+video { display: none; }
 </style>
-
 </head>
 
 <body>
 
 <h2>Plastic & Glass Bottle AI</h2>
 
-<p>Capture a bottle image and send it to AI.</p>
+<p>Live AI Detection - Render Cloud</p>
 
-<input
-    type="password"
-    id="token"
-    placeholder="Device Token">
+<input id="token" type="password"
+ placeholder="Device Token">
 
 <br>
 
-<input
-    type="file"
-    id="photo"
-    accept="image/*"
-    capture="environment">
-
-<br>
-
-<button onclick="sendImage()">
-Detect Bottle
+<button onclick="startCamera()">
+Start Camera
 </button>
 
-<pre id="result">Waiting for image...</pre>
+<button onclick="stopCamera()">
+Stop Camera
+</button>
+
+<p id="status">Camera stopped</p>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="view" width="640" height="480"></canvas>
+
+<p id="result">Waiting for detection...</p>
 
 <script>
-async function sendImage() {
 
-    const file = document.getElementById("photo").files[0];
+const video = document.getElementById("video");
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d");
+
+const statusText = document.getElementById("status");
+const resultText = document.getElementById("result");
+
+let stream = null;
+let running = false;
+let detections = [];
+
+function draw() {
+
+    if (running && video.readyState >= 2) {
+
+        ctx.drawImage(
+            video, 0, 0,
+            canvas.width, canvas.height
+        );
+
+        detections.forEach(d => {
+
+            const isPlastic = d.class === "plastic";
+
+            const color = isPlastic
+                ? "#22c55e"
+                : "#f59e0b";
+
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 4;
+
+            ctx.strokeRect(
+                d.x, d.y, d.w, d.h
+            );
+
+            const label =
+                d.class + " " +
+                Math.round(d.confidence * 100) + "%";
+
+            ctx.font = "bold 16px Arial";
+
+            const labelWidth =
+                ctx.measureText(label).width + 12;
+
+            const labelY = Math.max(22, d.y);
+
+            ctx.fillStyle = color;
+
+            ctx.fillRect(
+                d.x,
+                labelY - 22,
+                labelWidth,
+                24
+            );
+
+            ctx.fillStyle = "#101827";
+
+            ctx.fillText(
+                label,
+                d.x + 6,
+                labelY - 5
+            );
+        });
+    }
+
+    if (running) {
+        requestAnimationFrame(draw);
+    }
+}
+
+async function startCamera() {
+
+    if (running) return;
+
     const token = document.getElementById("token").value;
-    const result = document.getElementById("result");
 
-    if (!file || !token) {
-        result.textContent = "Select image and enter token.";
+    if (!token) {
+        statusText.textContent = "Enter Device Token";
         return;
     }
 
-    const form = new FormData();
-    form.append("image", file);
-
-    result.textContent = "Analyzing...";
-
     try {
-        const response = await fetch("/detect", {
-            method: "POST",
-            headers: {
-                "X-Device-Token": token
+
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: "environment",
+                width: { ideal: 640 },
+                height: { ideal: 480 }
             },
-            body: form
+            audio: false
         });
 
-        const data = await response.json();
+        video.srcObject = stream;
+        await video.play();
 
-        result.textContent =
-            JSON.stringify(data, null, 2);
+        running = true;
+
+        statusText.textContent = "Camera running";
+
+        draw();
+        detectLoop();
 
     } catch (error) {
-        result.textContent = "Error: " + error;
+        statusText.textContent =
+            "Camera error: " + error.message;
     }
 }
-</script>
 
+function stopCamera() {
+
+    running = false;
+    detections = [];
+
+    if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+    }
+
+    video.srcObject = null;
+    statusText.textContent = "Camera stopped";
+}
+
+async function detectLoop() {
+
+    while (running) {
+
+        const capture = document.createElement("canvas");
+        capture.width = 640;
+        capture.height = 480;
+
+        const c = capture.getContext("2d");
+
+        c.drawImage(video, 0, 0, 640, 480);
+
+        const blob = await new Promise(resolve =>
+            capture.toBlob(resolve, "image/jpeg", 0.65)
+        );
+
+        if (!blob || !running) break;
+
+        const form = new FormData();
+        form.append("image", blob, "frame.jpg");
+
+        const token =
+            document.getElementById("token").value;
+
+        try {
+
+            const response = await fetch("/detect", {
+                method: "POST",
+                headers: {
+                    "X-Device-Token": token
+                },
+                body: form
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                detections = [];
+                statusText.textContent =
+                    "Error: " +
+                    (data.error || response.status);
+                running = false;
+                break;
+            }
+
+            detections = data.boxes || [];
+
+            if (detections.length > 0) {
+
+                const best = detections[0];
+
+                resultText.textContent =
+                    best.class.toUpperCase() +
+                    " - " +
+                    Math.round(best.confidence * 100) +
+                    "%";
+
+            } else {
+                resultText.textContent =
+                    "No bottle detected";
+            }
+
+            statusText.textContent =
+                "AI detection active";
+
+        } catch (error) {
+
+            detections = [];
+            statusText.textContent =
+                "Network error: " + error.message;
+        }
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 800)
+        );
+    }
+}
+
+</script>
 </body>
 </html>
 """
@@ -349,117 +518,112 @@ def camera_page():
 
 
 # ==========================================
-# DETECTION API
+# DETECT FRAME
 # ==========================================
 
 @app.post("/detect")
-def detect_image():
+def detect_frame():
 
     global latest_result
 
     if not authorized():
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
+        return jsonify({"error": "Unauthorized"}), 401
 
     uploaded = request.files.get("image")
 
-    if uploaded is None:
-        return jsonify({
-            "error": "No image provided"
-        }), 400
+    if not uploaded:
+        return jsonify({"error": "No image"}), 400
+
+    image_bytes = uploaded.read()
+
+    image_array = np.frombuffer(
+        image_bytes, dtype=np.uint8
+    )
+
+    frame = cv2.imdecode(
+        image_array,
+        cv2.IMREAD_COLOR
+    )
+
+    if frame is None:
+        return jsonify({"error": "Invalid image"}), 400
 
     try:
-        raw = uploaded.read()
+        boxes = detect_objects(frame)
 
-        if not raw:
-            return jsonify({
-                "error": "Empty image"
-            }), 400
+    except Exception:
+        app.logger.exception("Inference failed")
+        return jsonify({"error": "Inference failed"}), 500
 
-        array = np.frombuffer(raw, dtype=np.uint8)
+    best = boxes[0] if boxes else None
 
-        frame = cv2.imdecode(
-            array,
-            cv2.IMREAD_COLOR
-        )
+    result = {
+        "detected": bool(boxes),
+        "class": best["class"] if best else "none",
+        "confidence": best["confidence"] if best else 0.0,
+        "boxes": boxes,
+        "timestamp": time.time()
+    }
 
-        if frame is None:
-            return jsonify({
-                "error": "Invalid image"
-            }), 400
+    with result_lock:
+        latest_result = result
 
-        label, confidence, box = detect(frame)
-
-        result = {
-            "detected": label != "none",
-            "class": label,
-            "confidence": round(confidence, 3),
-            "box": box,
-            "timestamp": time.time()
-        }
-
-        with lock:
-            latest_result = result
-
-        return jsonify(result)
-
-    except Exception as e:
-        app.logger.exception("Detection failed")
-
-        return jsonify({
-            "error": "Detection failed",
-            "type": type(e).__name__
-        }), 500
+    return jsonify(result)
 
 
 # ==========================================
-# ESP32 RESULT API
+# STATUS
 # ==========================================
 
-@app.get("/result")
-def result():
+@app.get("/")
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "Bottle AI Live Detection",
+        "camera": "/camera"
+    })
 
-    if not authorized():
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
-
-    with lock:
-        data = latest_result.copy()
-
-    if time.time() - data["timestamp"] > RESULT_MAX_AGE:
-        data["detected"] = False
-        data["class"] = "none"
-        data["confidence"] = 0.0
-        data["box"] = None
-
-    return jsonify(data)
-
-
-# ==========================================
-# STATUS API
-# ==========================================
 
 @app.get("/status")
 def status():
     return jsonify({
         "status": "online",
         "model_loaded": True,
-        "classes": CLASS_NAMES
+        "input_shape": input_info["shape"].tolist(),
+        "output_shape": output_info["shape"].tolist()
     })
 
 
+# Future ESP32 integration (not used yet)
+@app.get("/result")
+def result():
+
+    if not authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    with result_lock:
+        data = latest_result.copy()
+
+    if time.time() - data["timestamp"] > 5:
+        return jsonify({
+            "detected": False,
+            "class": "none",
+            "confidence": 0.0,
+            "boxes": [],
+            "timestamp": data["timestamp"]
+        })
+
+    return jsonify(data)
+
+
 # ==========================================
-# LOCAL START
+# START
 # ==========================================
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", "10000"))
-
     app.run(
         host="0.0.0.0",
-        port=port,
+        port=int(os.getenv("PORT", "10000")),
         debug=False
     )

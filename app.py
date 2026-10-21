@@ -6,65 +6,42 @@ import threading
 
 import cv2
 import numpy as np
-
-from flask import (
-    Flask,
-    request,
-    jsonify,
-    render_template_string
-)
-
+from flask import Flask, request, jsonify, Response
 from ai_edge_litert.interpreter import Interpreter
 
-
-# ==========================================
-# SERVER SETTINGS
-# ==========================================
-
 app = Flask(__name__)
-
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 MODEL_PATH = os.path.join(
-    BASE_DIR,
-    "waste_final_v1.tflite"
+    os.path.dirname(__file__),
+    'waste_final_v1.tflite'
 )
 
-# Original training classes - DO NOT reorder
-CLASS_NAMES = [
-    "plastic",
-    "paper",
-    "metal",
-    "glass"
-]
-
-# Display only plastic and glass
-ALLOWED_CLASSES = {"plastic", "glass"}
+CLASS_NAMES = ['plastic', 'paper', 'metal', 'glass']
+ALLOWED_CLASSES = {'plastic', 'glass'}
 
 CONF_THRESHOLD = 0.65
 NMS_THRESHOLD = 0.45
 
-DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "")
+# Same sorting area as the original PC code
+ARRIVAL_ROI = (0.25, 0.208333, 0.78125, 0.875)
+
+DEVICE_TOKEN = os.getenv('DEVICE_TOKEN', '')
 
 model_lock = threading.Lock()
 result_lock = threading.Lock()
 
 latest_result = {
-    "detected": False,
-    "class": "none",
-    "confidence": 0.0,
-    "boxes": [],
-    "timestamp": 0
+    'detected': False,
+    'class': 'none',
+    'confidence': 0.0,
+    'boxes': [],
+    'timestamp': 0
 }
 
-
 # ==========================================
-# LOAD TFLITE MODEL
+# LOAD MODEL
 # ==========================================
-
-print("Loading TFLite model...", flush=True)
 
 interpreter = Interpreter(
     model_path=MODEL_PATH,
@@ -76,9 +53,12 @@ interpreter.allocate_tensors()
 input_info = interpreter.get_input_details()[0]
 output_info = interpreter.get_output_details()[0]
 
-print("MODEL LOADED!", flush=True)
-print("Input:", input_info["shape"], flush=True)
-print("Output:", output_info["shape"], flush=True)
+print(
+    'MODEL LOADED',
+    input_info['shape'],
+    output_info['shape'],
+    flush=True
+)
 
 
 # ==========================================
@@ -86,45 +66,88 @@ print("Output:", output_info["shape"], flush=True)
 # ==========================================
 
 def authorized():
-    token = request.headers.get(
-        "X-Device-Token", ""
-    )
+    value = request.headers.get('X-Device-Token', '')
 
     return (
         bool(DEVICE_TOKEN)
-        and hmac.compare_digest(token, DEVICE_TOKEN)
+        and hmac.compare_digest(value, DEVICE_TOKEN)
     )
 
 
-@app.post("/auth")
-def authenticate():
-
-    if not authorized():
-        return jsonify({
-            "authorized": False,
-            "error": "Incorrect password"
-        }), 401
-
-    return jsonify({
-        "authorized": True,
-        "message": "Access granted"
-    })
-
-
 # ==========================================
-# PREPROCESS IMAGE
+# LETTERBOX PREPROCESSING
 # ==========================================
 
-def preprocess(frame):
+def letterbox(image, size):
+    """
+    Keep aspect ratio and add gray padding,
+    similar to Ultralytics YOLO.
+    """
 
-    shape = input_info["shape"]
+    src_h, src_w = image.shape[:2]
+    dst_w, dst_h = size
 
-    model_h = int(shape[1])
-    model_w = int(shape[2])
+    scale = min(
+        dst_w / src_w,
+        dst_h / src_h
+    )
+
+    resized_w = round(src_w * scale)
+    resized_h = round(src_h * scale)
+
+    dw = (dst_w - resized_w) / 2
+    dh = (dst_h - resized_h) / 2
 
     image = cv2.resize(
-        frame,
-        (model_w, model_h)
+        image,
+        (resized_w, resized_h),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    top = round(dh - 0.1)
+    bottom = round(dh + 0.1)
+    left = round(dw - 0.1)
+    right = round(dw + 0.1)
+
+    image = cv2.copyMakeBorder(
+        image,
+        top,
+        bottom,
+        left,
+        right,
+        cv2.BORDER_CONSTANT,
+        value=(114, 114, 114)
+    )
+
+    return image, scale, left, top
+
+
+# ==========================================
+# DETECTION
+# ==========================================
+
+def detection_on_frame(frame):
+
+    frame_h, frame_w = frame.shape[:2]
+
+    rx1 = int(ARRIVAL_ROI[0] * frame_w)
+    ry1 = int(ARRIVAL_ROI[1] * frame_h)
+    rx2 = int(ARRIVAL_ROI[2] * frame_w)
+    ry2 = int(ARRIVAL_ROI[3] * frame_h)
+
+    crop = frame[ry1:ry2, rx1:rx2]
+
+    if crop.size == 0:
+        raise ValueError('ROI empty')
+
+    input_shape = input_info['shape']
+
+    mh = int(input_shape[1])
+    mw = int(input_shape[2])
+
+    image, ratio, pad_x, pad_y = letterbox(
+        crop,
+        (mw, mh)
     )
 
     image = cv2.cvtColor(
@@ -132,7 +155,7 @@ def preprocess(frame):
         cv2.COLOR_BGR2RGB
     )
 
-    dtype = input_info["dtype"]
+    dtype = input_info['dtype']
 
     if np.issubdtype(dtype, np.floating):
 
@@ -140,16 +163,16 @@ def preprocess(frame):
 
     else:
 
-        scale, zero = input_info["quantization"]
+        scale, zero = input_info['quantization']
 
         if scale <= 0:
             raise ValueError(
-                "Unsupported input quantization"
+                'Unsupported input quantization'
             )
 
-        tensor = np.round(
-            image.astype(np.float32)
-            / 255.0 / scale + zero
+        tensor = np.rint(
+            (image.astype(np.float32) / 255.0)
+            / scale + zero
         )
 
         info = np.iinfo(dtype)
@@ -160,170 +183,205 @@ def preprocess(frame):
             info.max
         ).astype(dtype)
 
-    return np.expand_dims(tensor, axis=0)
+    tensor = np.expand_dims(
+        tensor,
+        axis=0
+    )
 
-
-# ==========================================
-# YOLO OBJECT DETECTION
-# ==========================================
-
-def detect_objects(frame):
-
-    original_h, original_w = frame.shape[:2]
-
-    model_h = int(input_info["shape"][1])
-    model_w = int(input_info["shape"][2])
-
-    tensor = preprocess(frame)
+    # ======================================
+    # RUN TFLITE MODEL
+    # ======================================
 
     with model_lock:
 
         interpreter.set_tensor(
-            input_info["index"],
+            input_info['index'],
             tensor
         )
 
         interpreter.invoke()
 
-        output = interpreter.get_tensor(
-            output_info["index"]
+        raw = interpreter.get_tensor(
+            output_info['index']
         )
 
-    scale, zero = output_info["quantization"]
+    scale, zero = output_info['quantization']
 
     if scale > 0:
 
-        output = (
-            output.astype(np.float32) - zero
+        raw = (
+            raw.astype(np.float32) - zero
         ) * scale
 
-    predictions = np.squeeze(output)
+    predictions = np.squeeze(raw)
 
-    num_channels = 4 + len(CLASS_NAMES)
+    channels = 4 + len(CLASS_NAMES)
 
     if predictions.ndim != 2:
         raise ValueError(
-            "Unsupported model output: "
-            + str(output.shape)
+            'Unexpected output shape: {}'.format(
+                raw.shape
+            )
         )
 
-    if predictions.shape[0] == num_channels:
+    if predictions.shape[0] == channels:
         predictions = predictions.T
 
-    if predictions.shape[1] != num_channels:
+    if predictions.shape[1] != channels:
         raise ValueError(
-            "Wrong class count or output: "
-            + str(output.shape)
+            'Expected {} channels but got {}'.format(
+                channels,
+                raw.shape
+            )
         )
 
+    # ======================================
+    # FILTER PLASTIC AND GLASS
+    # ======================================
+
+    classes = predictions[:, 4:]
+
+    class_ids = np.argmax(
+        classes,
+        axis=1
+    )
+
+    confidence = np.max(
+        classes,
+        axis=1
+    )
+
+    accepted_ids = [
+        i for i, name in enumerate(CLASS_NAMES)
+        if name in ALLOWED_CLASSES
+    ]
+
+    keep = (
+        (confidence >= CONF_THRESHOLD)
+        & np.isin(class_ids, accepted_ids)
+    )
+
+    selected = predictions[keep]
+    selected_class_ids = class_ids[keep]
+    selected_confidence = confidence[keep]
+
     boxes = []
-    confidences = []
-    class_ids = []
+    scores = []
+    ids = []
 
-    sx = original_w / model_w
-    sy = original_h / model_h
+    crop_h, crop_w = crop.shape[:2]
 
-    for prediction in predictions:
+    # ======================================
+    # CONVERT BOX COORDINATES
+    # ======================================
 
-        scores = prediction[4:]
+    for prediction, cls_id, conf in zip(
+        selected,
+        selected_class_ids,
+        selected_confidence
+    ):
 
-        class_id = int(np.argmax(scores))
-        confidence = float(scores[class_id])
+        cx, cy, bw, bh = map(
+            float,
+            prediction[:4]
+        )
 
-        if confidence < CONF_THRESHOLD:
-            continue
+        x1 = (cx - bw / 2 - pad_x) / ratio
+        y1 = (cy - bh / 2 - pad_y) / ratio
 
-        label = CLASS_NAMES[class_id]
+        x2 = (cx + bw / 2 - pad_x) / ratio
+        y2 = (cy + bh / 2 - pad_y) / ratio
 
-        if label not in ALLOWED_CLASSES:
-            continue
+        x1 = max(0, min(crop_w, x1))
+        y1 = max(0, min(crop_h, y1))
 
-        cx, cy, w, h = prediction[:4]
-
-        x1 = int((cx - w / 2) * sx)
-        y1 = int((cy - h / 2) * sy)
-        x2 = int((cx + w / 2) * sx)
-        y2 = int((cy + h / 2) * sy)
-
-        x1 = max(0, min(x1, original_w - 1))
-        y1 = max(0, min(y1, original_h - 1))
-        x2 = max(0, min(x2, original_w))
-        y2 = max(0, min(y2, original_h))
+        x2 = max(0, min(crop_w, x2))
+        y2 = max(0, min(crop_h, y2))
 
         if x2 <= x1 or y2 <= y1:
             continue
 
         boxes.append([
-            x1,
-            y1,
-            x2 - x1,
-            y2 - y1
+            int(x1 + rx1),
+            int(y1 + ry1),
+            int(x2 - x1),
+            int(y2 - y1)
         ])
 
-        confidences.append(confidence)
-        class_ids.append(class_id)
+        scores.append(float(conf))
+        ids.append(int(cls_id))
 
-    detections = []
+    # ======================================
+    # NON MAXIMUM SUPPRESSION
+    # ======================================
 
-    # NMS separately for each class
-    for class_id in set(class_ids):
+    objects = []
+
+    for cls_id in set(ids):
 
         positions = [
-            i for i, c in enumerate(class_ids)
-            if c == class_id
+            i for i, c in enumerate(ids)
+            if c == cls_id
         ]
 
-        group_boxes = [boxes[i] for i in positions]
+        grouped = [
+            boxes[i] for i in positions
+        ]
 
         group_scores = [
-            confidences[i] for i in positions
+            scores[i] for i in positions
         ]
 
         indices = cv2.dnn.NMSBoxes(
-            group_boxes,
+            grouped,
             group_scores,
             CONF_THRESHOLD,
             NMS_THRESHOLD
         )
 
-        for index in np.array(indices).reshape(-1):
+        for item in np.array(indices).reshape(-1):
 
-            i = positions[int(index)]
+            j = positions[int(item)]
 
-            x, y, w, h = boxes[i]
+            x, y, w, h = boxes[j]
 
-            detections.append({
-                "class": CLASS_NAMES[class_id],
-                "confidence": round(
-                    confidences[i], 3
-                ),
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h
+            objects.append({
+                'class': CLASS_NAMES[cls_id],
+                'confidence': round(scores[j], 3),
+                'x': x,
+                'y': y,
+                'w': w,
+                'h': h
             })
 
-    detections.sort(
-        key=lambda d: d["confidence"],
+    objects.sort(
+        key=lambda d: d['confidence'],
         reverse=True
     )
 
-    return detections[:10]
+    roi = [
+        rx1,
+        ry1,
+        rx2 - rx1,
+        ry2 - ry1
+    ]
+
+    return objects[:10], roi
 
 
 # ==========================================
-# CAMERA WEBSITE
+# LIVE CAMERA WEBSITE
 # ==========================================
 
-CAMERA_HTML = """
-<!DOCTYPE html>
+CAMERA_HTML = r"""
+<!doctype html>
 <html lang="en">
 
 <head>
 <meta charset="UTF-8">
 
 <meta name="viewport"
-content="width=device-width, initial-scale=1">
+content="width=device-width,initial-scale=1">
 
 <title>Plastic & Glass Bottle AI</title>
 
@@ -334,105 +392,86 @@ content="width=device-width, initial-scale=1">
 }
 
 body {
-    margin: 0;
-    padding: 16px;
     background: #0f172a;
-    color: white;
-    font-family: Arial, sans-serif;
+    color: #fff;
     text-align: center;
-}
-
-h2 {
-    margin: 10px 0;
-}
-
-#loginScreen {
-    max-width: 380px;
-    margin: 60px auto;
-    padding: 24px;
-    background: #1e293b;
-    border-radius: 16px;
-}
-
-#password {
-    width: 100%;
+    font-family: Arial, sans-serif;
+    margin: 0;
     padding: 14px;
-    margin: 12px 0;
+}
+
+#login {
+    max-width: 380px;
+    margin: 12vh auto;
+    background: #1e293b;
+    padding: 24px;
+    border-radius: 14px;
+}
+
+input, button {
+    padding: 13px;
     font-size: 17px;
     border-radius: 8px;
-    border: none;
+    border: 0;
+    margin: 8px 0;
+}
+
+input {
+    width: 100%;
 }
 
 button {
-    padding: 13px 25px;
     background: #22c55e;
-    border: none;
-    border-radius: 8px;
-    font-size: 17px;
     font-weight: bold;
     cursor: pointer;
 }
 
-button:disabled {
-    opacity: 0.55;
-}
-
-#cameraScreen {
+#camera {
     display: none;
 }
 
-#viewer {
-    position: relative;
+canvas {
     width: 100%;
     max-width: 720px;
-    margin: 14px auto;
-    border: 2px solid #22c55e;
-    border-radius: 12px;
-    overflow: hidden;
-    background: black;
-}
-
-#canvas {
-    display: block;
-    width: 100%;
     height: auto;
+    background: #000;
+    border: 2px solid #22c55e;
+    border-radius: 10px;
 }
 
-#video {
+video {
     display: none;
-}
-
-#status {
-    margin: 12px 0;
-    color: #cbd5e1;
 }
 
 #result {
     font-size: 23px;
     font-weight: bold;
     color: #86efac;
-    margin: 12px;
+}
+
+#status {
+    color: #cbd5e1;
 }
 
 #error {
     color: #fca5a5;
-    min-height: 22px;
 }
 
-#retryButton {
+#enable {
     display: none;
 }
 
 </style>
+
 </head>
 
 <body>
 
-<div id="loginScreen">
+<div id="login">
 
     <h2>Plastic & Glass Bottle AI</h2>
 
-    <p>Enter password to access live detection</p>
+    <p>Enter password before opening the camera</p>
 
     <input
         id="password"
@@ -441,10 +480,7 @@ button:disabled {
         autocomplete="off"
     >
 
-    <br>
-
-    <button id="connectButton"
-            onclick="connectServer()">
+    <button id="connect">
         Connect
     </button>
 
@@ -453,39 +489,34 @@ button:disabled {
 </div>
 
 
-<div id="cameraScreen">
+<div id="camera">
 
     <h2>Live Bottle Detection</h2>
 
     <p id="status">Opening camera...</p>
 
-    <button id="retryButton"
-            onclick="startCamera()">
+    <button id="enable">
         Enable Camera
     </button>
 
-    <div id="viewer">
+    <video
+        id="video"
+        autoplay
+        muted
+        playsinline>
+    </video>
 
-        <video
-            id="video"
-            autoplay
-            muted
-            playsinline>
-        </video>
+    <canvas
+        id="canvas"
+        width="640"
+        height="480">
+    </canvas>
 
-        <canvas
-            id="canvas"
-            width="640"
-            height="480">
-        </canvas>
-
-    </div>
-
-    <div id="result">
+    <p id="result">
         Waiting for AI...
-    </div>
+    </p>
 
-    <button onclick="logout()">
+    <button id="disconnect">
         Disconnect
     </button>
 
@@ -494,131 +525,102 @@ button:disabled {
 
 <script>
 
-const loginScreen =
-    document.getElementById("loginScreen");
+const $ = id => document.getElementById(id);
 
-const cameraScreen =
-    document.getElementById("cameraScreen");
+const video = $('video');
+const canvas = $('canvas');
 
-const passwordInput =
-    document.getElementById("password");
+const ctx = canvas.getContext('2d');
 
-const connectButton =
-    document.getElementById("connectButton");
-
-const errorEl =
-    document.getElementById("error");
-
-const video =
-    document.getElementById("video");
-
-const canvas =
-    document.getElementById("canvas");
-
-const ctx =
-    canvas.getContext("2d");
-
-const statusEl =
-    document.getElementById("status");
-
-const resultEl =
-    document.getElementById("result");
-
-const retryButton =
-    document.getElementById("retryButton");
-
-
-let deviceToken = "";
+let token = '';
 let stream = null;
 let running = false;
-let detections = [];
-let lastDetectionTime = 0;
-let sessionId = 0;
 
-const DETECTION_DELAY = 700;
-const BOX_MAX_AGE = 3000;
+let current = 0;
+let boxes = [];
+let roi = null;
+let updated = 0;
 
-
-function sleep(ms) {
-    return new Promise(resolve => {
-        setTimeout(resolve, ms);
-    });
-}
+const sleep = ms =>
+    new Promise(r => setTimeout(r, ms));
 
 
-// ====================================
-// LOGIN FIRST - VERIFY TOKEN
-// ====================================
+// ======================================
+// LOGIN
+// ======================================
 
-async function connectServer() {
+$('connect').onclick = async () => {
 
-    const token = passwordInput.value.trim();
+    const candidate = $('password').value.trim();
 
-    if (!token) {
-        errorEl.textContent =
-            "Please enter your password";
+    if (!candidate) {
+        $('error').textContent = 'Enter Device Token';
         return;
     }
 
-    connectButton.disabled = true;
-    errorEl.textContent = "Checking password...";
+    $('connect').disabled = true;
+
+    $('error').textContent = 'Checking password...';
 
     try {
 
-        const response = await fetch("/auth", {
-            method: "POST",
+        const response = await fetch('/auth', {
+            method: 'POST',
             headers: {
-                "X-Device-Token": token
+                'X-Device-Token': candidate
             }
         });
 
         if (!response.ok) {
-            errorEl.textContent =
-                "Incorrect password";
+            $('error').textContent = 'Incorrect password';
             return;
         }
 
-        deviceToken = token;
+        token = candidate;
 
-        // Do not keep the password in the input
-        passwordInput.value = "";
+        $('password').value = '';
 
-        loginScreen.style.display = "none";
-        cameraScreen.style.display = "block";
+        $('login').style.display = 'none';
+        $('camera').style.display = 'block';
 
-        startCamera();
+        await startCamera();
 
-    } catch (error) {
+    } catch (e) {
 
-        errorEl.textContent =
-            "Server connection failed";
+        $('error').textContent =
+            'Connection problem: ' + e.message;
 
     } finally {
 
-        connectButton.disabled = false;
+        $('connect').disabled = false;
     }
-}
+};
 
 
-// ====================================
-// OPEN CAMERA AFTER LOGIN
-// ====================================
+$('password').addEventListener(
+    'keydown',
+    e => {
+        if (e.key === 'Enter') {
+            $('connect').click();
+        }
+    }
+);
+
+
+// ======================================
+// START LIVE CAMERA
+// ======================================
 
 async function startCamera() {
 
     if (running) return;
-
-    statusEl.textContent =
-        "Opening camera...";
-
-    retryButton.style.display = "none";
 
     try {
 
         stream = await navigator.mediaDevices.getUserMedia({
             video: {
                 facingMode: {
-                    ideal: "environment"
+                    ideal: 'environment'
                 },
                 width: {
                     ideal: 640
@@ -634,41 +636,37 @@ async function startCamera() {
 
         await video.play();
 
-        canvas.width =
-            video.videoWidth || 640;
-
-        canvas.height =
-            video.videoHeight || 480;
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
 
         running = true;
-        sessionId++;
+        current++;
 
-        statusEl.textContent =
-            "CAMERA LIVE - AI CONNECTED";
+        $('enable').style.display = 'none';
+        $('status').textContent = 'Live camera';
 
-        const currentSession = sessionId;
+        drawLoop(current);
+        detectLoop(current);
 
-        drawLoop(currentSession);
-        detectLoop(currentSession);
+    } catch (e) {
 
-    } catch (error) {
+        $('status').textContent =
+            'Camera permission required: ' + e.message;
 
-        statusEl.textContent =
-            "Camera error: " + error.message;
-
-        retryButton.style.display =
-            "inline-block";
+        $('enable').style.display = 'inline-block';
     }
 }
 
+$('enable').onclick = startCamera;
 
-// ====================================
-// DRAW LIVE VIDEO AND BOXES
-// ====================================
 
-function drawLoop(currentSession) {
+// ======================================
+// DRAW VIDEO + SORTING ZONE + BOXES
+// ======================================
 
-    if (!running || currentSession !== sessionId) {
+function drawLoop(id) {
+
+    if (!running || id !== current) {
         return;
     }
 
@@ -682,247 +680,242 @@ function drawLoop(currentSession) {
             canvas.height
         );
 
-        const fresh =
-            Date.now() - lastDetectionTime
-            < BOX_MAX_AGE;
+        // Sorting zone rectangle
+        if (roi) {
 
-        if (fresh) {
+            ctx.strokeStyle = '#00d5ff';
+            ctx.lineWidth = 2;
 
-            for (const d of detections) {
+            ctx.strokeRect(...roi);
+
+            ctx.font = 'bold 14px Arial';
+            ctx.fillStyle = '#00d5ff';
+
+            ctx.fillText(
+                'SORTING ZONE',
+                roi[0],
+                Math.max(16, roi[1] - 7)
+            );
+        }
+
+        // Detection boxes
+        if (Date.now() - updated < 2500) {
+
+            for (const d of boxes) {
 
                 const color =
-                    d.class === "plastic"
-                    ? "#22c55e"
-                    : "#38bdf8";
+                    d.class === 'plastic'
+                        ? '#22c55e'
+                        : '#ffad22';
 
-                ctx.strokeStyle = color;
                 ctx.lineWidth = 4;
+                ctx.strokeStyle = color;
 
                 ctx.strokeRect(
-                    d.x, d.y, d.w, d.h
+                    d.x,
+                    d.y,
+                    d.w,
+                    d.h
                 );
 
                 const label =
-                    d.class.toUpperCase()
-                    + " "
-                    + Math.round(
-                        d.confidence * 100
-                    )
-                    + "%";
+                    d.class + ' ' +
+                    Math.round(d.confidence * 100) + '%';
 
-                ctx.font = "bold 18px Arial";
+                ctx.font = 'bold 17px Arial';
 
-                const labelWidth =
+                const y = Math.max(23, d.y);
+
+                const tw =
                     ctx.measureText(label).width + 12;
-
-                const labelY =
-                    Math.max(d.y, 26);
 
                 ctx.fillStyle = color;
 
                 ctx.fillRect(
                     d.x,
-                    labelY - 25,
-                    labelWidth,
-                    26
+                    y - 23,
+                    tw,
+                    24
                 );
 
-                ctx.fillStyle = "#000";
+                ctx.fillStyle = '#111';
 
                 ctx.fillText(
                     label,
                     d.x + 6,
-                    labelY - 5
+                    y - 6
                 );
             }
         }
     }
 
     requestAnimationFrame(
-        () => drawLoop(currentSession)
+        () => drawLoop(id)
     );
 }
 
 
-// ====================================
-// SEND FRAMES AUTOMATICALLY
-// ====================================
+// ======================================
+// CONTINUOUS CLOUD DETECTION
+// ======================================
 
-async function detectLoop(currentSession) {
+async function detectLoop(id) {
 
-    while (
-        running &&
-        currentSession === sessionId
-    ) {
+    while (running && id === current) {
 
-        if (video.readyState < 2) {
-            await sleep(300);
-            continue;
-        }
+        const shot = document.createElement('canvas');
 
-        const capture =
-            document.createElement("canvas");
+        shot.width = canvas.width;
+        shot.height = canvas.height;
 
-        capture.width = canvas.width;
-        capture.height = canvas.height;
-
-        capture.getContext("2d").drawImage(
+        shot.getContext('2d').drawImage(
             video,
             0,
             0,
-            capture.width,
-            capture.height
+            shot.width,
+            shot.height
         );
 
-        const blob = await new Promise(resolve => {
-            capture.toBlob(
-                resolve,
-                "image/jpeg",
+        const blob = await new Promise(
+            r => shot.toBlob(
+                r,
+                'image/jpeg',
                 0.65
-            );
-        });
+            )
+        );
 
         if (!blob) {
-            await sleep(500);
+            await sleep(300);
             continue;
         }
 
         const form = new FormData();
 
         form.append(
-            "image",
+            'image',
             blob,
-            "frame.jpg"
+            'frame.jpg'
         );
 
         try {
 
-            const response = await fetch("/detect", {
-                method: "POST",
+            $('status').textContent =
+                'Camera LIVE - analyzing...';
+
+            const resp = await fetch('/detect', {
+                method: 'POST',
                 headers: {
-                    "X-Device-Token": deviceToken
+                    'X-Device-Token': token
                 },
                 body: form
             });
 
-            const data = await response.json();
+            const data = await resp.json();
 
-            if (
-                !running ||
-                currentSession !== sessionId
-            ) {
+            if (!running || id !== current) {
                 break;
             }
 
-            if (!response.ok) {
+            if (resp.status === 401) {
 
-                detections = [];
-                lastDetectionTime = 0;
+                stop();
 
-                if (response.status === 401) {
-                    logout();
-                    errorEl.textContent =
-                        "Session expired or wrong token";
-                    break;
-                }
+                $('error').textContent =
+                    'Incorrect or expired token';
 
-                statusEl.textContent =
-                    "AI error: " +
-                    (data.error || response.status);
+                break;
+            }
+
+            if (!resp.ok) {
+
+                boxes = [];
+
+                $('status').textContent =
+                    data.error || ('Error ' + resp.status);
 
                 await sleep(1200);
                 continue;
             }
 
-            detections = data.boxes || [];
-            lastDetectionTime = Date.now();
+            boxes = data.boxes || [];
+            roi = data.roi;
 
-            if (detections.length > 0) {
+            updated = Date.now();
 
-                const best = detections[0];
+            if (boxes.length) {
 
-                resultEl.textContent =
-                    best.class.toUpperCase()
-                    + " - "
+                $('result').textContent =
+                    boxes[0].class.toUpperCase()
+                    + ' - '
                     + Math.round(
-                        best.confidence * 100
+                        boxes[0].confidence * 100
                     )
-                    + "%";
+                    + '%';
 
             } else {
 
-                resultEl.textContent =
-                    "No plastic or glass detected";
+                $('result').textContent =
+                    'No plastic or glass detected';
             }
 
-            statusEl.textContent =
-                "CAMERA LIVE - AI ACTIVE";
+            $('status').textContent =
+                'Camera LIVE - AI connected';
 
-        } catch (error) {
+        } catch (e) {
 
-            detections = [];
-            lastDetectionTime = 0;
+            boxes = [];
 
-            statusEl.textContent =
-                "Network error: " + error.message;
+            $('status').textContent =
+                'Connection error: ' + e.message;
         }
 
-        await sleep(DETECTION_DELAY);
+        await sleep(700);
     }
 }
 
 
-// ====================================
-// LOGOUT
-// ====================================
+// ======================================
+// DISCONNECT
+// ======================================
 
-function logout() {
+function stop() {
 
     running = false;
-    sessionId++;
+    current++;
 
     if (stream) {
+
         stream.getTracks().forEach(
-            track => track.stop()
+            t => t.stop()
         );
+
         stream = null;
     }
 
     video.srcObject = null;
 
-    detections = [];
-    lastDetectionTime = 0;
-    deviceToken = "";
+    boxes = [];
+    roi = null;
+    token = '';
 
-    cameraScreen.style.display = "none";
-    loginScreen.style.display = "block";
+    $('camera').style.display = 'none';
+    $('login').style.display = 'block';
 
-    passwordInput.value = "";
-    errorEl.textContent = "";
+    $('password').value = '';
 }
 
+$('disconnect').onclick = stop;
 
-// Press Enter to login
-passwordInput.addEventListener(
-    "keydown",
-    function(event) {
-        if (event.key === "Enter") {
-            connectServer();
+window.addEventListener(
+    'pagehide',
+    () => {
+        if (stream) {
+            stream.getTracks().forEach(
+                t => t.stop()
+            );
         }
     }
 );
-
-
-window.addEventListener("pagehide", () => {
-    running = false;
-    sessionId++;
-
-    if (stream) {
-        stream.getTracks().forEach(
-            track => track.stop()
-        );
-    }
-});
 
 </script>
 
@@ -932,106 +925,107 @@ window.addEventListener("pagehide", () => {
 
 
 # ==========================================
-# ROUTES
+# FLASK ROUTES
 # ==========================================
 
-@app.get("/")
+@app.get('/')
 def home():
 
     return jsonify({
-        "status": "online",
-        "service": "Plastic Glass Bottle AI",
-        "camera": "/camera",
-        "allowed_classes": [
-            "plastic",
-            "glass"
-        ]
+        'status': 'online',
+        'camera': '/camera',
+        'model': 'waste_final_v1.tflite'
     })
 
 
-@app.get("/camera")
+@app.get('/camera')
 def camera_page():
 
-    response = app.make_response(
-        render_template_string(CAMERA_HTML)
+    return Response(
+        CAMERA_HTML,
+        mimetype='text/html',
+        headers={
+            'Cache-Control': 'no-store'
+        }
     )
 
-    response.headers["Cache-Control"] = "no-store"
 
-    return response
+@app.post('/auth')
+def auth():
+
+    if not authorized():
+
+        return jsonify({
+            'authorized': False
+        }), 401
+
+    return jsonify({
+        'authorized': True
+    })
 
 
-# ==========================================
-# DETECT API
-# ==========================================
-
-@app.post("/detect")
-def detect_frame():
+@app.post('/detect')
+def detect():
 
     global latest_result
 
     if not authorized():
 
         return jsonify({
-            "error": "Unauthorized"
+            'error': 'Unauthorized'
         }), 401
 
-    uploaded = request.files.get("image")
+    picture = request.files.get('image')
 
-    if uploaded is None:
-
-        return jsonify({
-            "error": "No image received"
-        }), 400
-
-    image_bytes = uploaded.read()
-
-    if not image_bytes:
+    if picture is None:
 
         return jsonify({
-            "error": "Empty image"
+            'error': 'No image'
         }), 400
 
-    image_array = np.frombuffer(
-        image_bytes,
-        dtype=np.uint8
+    data = np.frombuffer(
+        picture.read(),
+        np.uint8
     )
 
     frame = cv2.imdecode(
-        image_array,
+        data,
         cv2.IMREAD_COLOR
     )
 
     if frame is None:
 
         return jsonify({
-            "error": "Invalid image"
+            'error': 'Invalid image'
         }), 400
 
     try:
 
-        boxes = detect_objects(frame)
+        boxes, roi = detection_on_frame(frame)
 
     except Exception:
 
-        app.logger.exception("Inference error")
+        app.logger.exception(
+            'Detection failed'
+        )
 
         return jsonify({
-            "error": "Model inference failed"
+            'error': 'Detection failed - check Render Logs'
         }), 500
 
     best = boxes[0] if boxes else None
 
     result = {
-        "detected": bool(boxes),
-        "class": (
-            best["class"] if best else "none"
+        'detected': bool(boxes),
+        'class': (
+            best['class'] if best else 'none'
         ),
-        "confidence": (
-            best["confidence"] if best else 0.0
+        'confidence': (
+            best['confidence'] if best else 0.0
         ),
-        "boxes": boxes,
-        "timestamp": time.time()
+        'boxes': boxes,
+        'roi': roi,
+        'timestamp': time.time()
     }
 
     with result_lock:
@@ -1040,59 +1034,52 @@ def detect_frame():
     return jsonify(result)
 
 
-# ==========================================
-# STATUS API
-# ==========================================
-
-@app.get("/status")
+@app.get('/status')
 def status():
 
     return jsonify({
-        "status": "online",
-        "model_loaded": True,
-        "input_shape": input_info["shape"].tolist(),
-        "output_shape": output_info["shape"].tolist(),
-        "allowed_classes": [
-            "plastic",
-            "glass"
+        'online': True,
+        'input_shape': input_info['shape'].tolist(),
+        'output_shape': output_info['shape'].tolist(),
+        'allowed_classes': [
+            'plastic',
+            'glass'
         ]
     })
 
 
-# ==========================================
-# FUTURE ESP32 API
-# ==========================================
-
-@app.get("/result")
+@app.get('/result')
 def get_result():
 
     if not authorized():
 
         return jsonify({
-            "error": "Unauthorized"
+            'error': 'Unauthorized'
         }), 401
 
     with result_lock:
         data = latest_result.copy()
 
-    if time.time() - data["timestamp"] > 5:
+    if time.time() - data['timestamp'] > 3:
 
-        data["detected"] = False
-        data["class"] = "none"
-        data["confidence"] = 0.0
-        data["boxes"] = []
+        data.update({
+            'detected': False,
+            'class': 'none',
+            'confidence': 0.0,
+            'boxes': []
+        })
 
     return jsonify(data)
 
 
 # ==========================================
-# START SERVER
+# RUN SERVER
 # ==========================================
 
-if __name__ == "__main__":
+if __name__ == '__main__':
 
     app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
+        host='0.0.0.0',
+        port=int(os.getenv('PORT', '10000')),
         debug=False
     )

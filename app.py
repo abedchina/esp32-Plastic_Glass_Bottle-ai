@@ -46,7 +46,8 @@ SELECTED_CLASS_IDS = [
     if name in ALLOWED_CLASSES
 ]
 
-CONF_THRESHOLD = 0.65
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.5"))
+MIN_CONF, MAX_CONF = 0.2, 0.95   # range allowed from the sensitivity slider
 IOU_THRESHOLD = 0.45
 
 # Same sorting zone as the PC project
@@ -196,7 +197,7 @@ def auth():
 # DETECT BOTTLES
 # =========================================
 
-def detect_bottles(frame):
+def detect_bottles(frame, conf=CONF_THRESHOLD):
 
     height, width = frame.shape[:2]
 
@@ -217,7 +218,7 @@ def detect_bottles(frame):
     with model_lock:
         found = model.predict(
             roi_image,
-            conf=CONF_THRESHOLD,
+            conf=conf,
             iou=IOU_THRESHOLD,
             classes=SELECTED_CLASS_IDS
         )
@@ -338,8 +339,49 @@ button:disabled {
     display: none;
 }
 
+/* kept on the page (not display:none) so phones keep decoding frames */
 #video {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: center;
+    align-items: center;
+    max-width: 720px;
+    margin: 8px auto;
+}
+
+select {
+    padding: 10px;
+    border-radius: 8px;
+    font-size: 15px;
+    max-width: 100%;
+}
+
+.tools label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #cbd5e1;
+}
+
+.tools input[type=range] {
+    width: 160px;
+    margin: 0;
+    padding: 0;
+}
+
+#warn {
+    color: #fcd34d;
+    max-width: 720px;
+    margin: 8px auto;
 }
 
 #canvas {
@@ -405,6 +447,17 @@ button:disabled {
         Enable Camera
     </button>
 
+    <div class="tools">
+        <select id="cameraSelect" aria-label="Camera"></select>
+        <button id="restart">Restart camera</button>
+        <label>Sensitivity
+            <input id="sens" type="range" min="20" max="90" value="50">
+            <b id="sensVal">50%</b>
+        </label>
+    </div>
+
+    <p id="warn"></p>
+
     <video id="video" autoplay muted playsinline></video>
 
     <canvas
@@ -414,6 +467,7 @@ button:disabled {
     </canvas>
 
     <p id="result">Waiting for AI...</p>
+    <p style="color:#94a3b8;font-size:14px">Lower sensitivity % = detects more (also weak or blurry items). Keep the bottle inside SORTING ZONE.</p>
 
     <button id="disconnect">
         Disconnect
@@ -501,24 +555,62 @@ $("password").addEventListener("keydown", event => {
 // CAMERA
 // =====================================
 
+let cameraId = "";
+
+async function listCameras() {
+    try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === "videoinput");
+        const sel = $("cameraSelect");
+        sel.innerHTML = "";
+        cams.forEach((c, i) => {
+            const o = document.createElement("option");
+            o.value = c.deviceId;
+            o.textContent = c.label || ("Camera " + (i + 1));
+            sel.appendChild(o);
+        });
+        const current = stream && stream.getVideoTracks()[0].getSettings().deviceId;
+        if (current) sel.value = current;
+        sel.style.display = cams.length > 1 ? "inline-block" : "none";
+    } catch (e) {}
+}
+
 async function startCamera() {
 
     if (running) return;
 
     $("status").textContent = "Opening camera...";
+    $("warn").textContent = "";
 
     try {
+        // higher resolution = sharper image for the AI
+        const videoConstraints = cameraId
+            ? {deviceId: {exact: cameraId}}
+            : {facingMode: {ideal: "environment"}};
+        videoConstraints.width = {ideal: 1280};
+        videoConstraints.height = {ideal: 720};
+
         stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-                facingMode: {ideal: "environment"},
-                width: {ideal: 640},
-                height: {ideal: 480}
-            },
+            video: videoConstraints,
             audio: false
         });
 
+        // ask for continuous autofocus where the camera supports it
+        const track = stream.getVideoTracks()[0];
+        try {
+            const caps = track.getCapabilities ? track.getCapabilities() : {};
+            if (caps.focusMode && caps.focusMode.includes("continuous")) {
+                await track.applyConstraints({advanced: [{focusMode: "continuous"}]});
+            }
+        } catch (e) {}
+
         video.srcObject = stream;
         await video.play();
+
+        // wait until the camera really delivers frames
+        for (let i = 0; i < 30 && !video.videoWidth; i++) {
+            await sleep(100);
+        }
 
         canvas.width = video.videoWidth || 640;
         canvas.height = video.videoHeight || 480;
@@ -531,14 +623,65 @@ async function startCamera() {
         $("enable").style.display = "none";
         $("status").textContent = "Camera LIVE";
 
+        listCameras();
         drawLoop(mySession);
         detectLoop(mySession);
 
     } catch (error) {
         $("status").textContent =
             "Camera error: " + error.message;
+        $("warn").textContent =
+            "Close other apps or tabs that use the camera, then press Enable Camera.";
 
         $("enable").style.display = "inline-block";
+    }
+}
+
+function stopStream() {
+    running = false;
+    session++;
+    if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+    }
+    video.srcObject = null;
+}
+
+async function restartCamera() {
+    stopStream();
+    await sleep(300);
+    await startCamera();
+}
+
+$("restart").onclick = restartCamera;
+
+$("cameraSelect").onchange = () => {
+    cameraId = $("cameraSelect").value;
+    restartCamera();
+};
+
+$("sens").oninput = () => {
+    $("sensVal").textContent = $("sens").value + "%";
+};
+
+// a black picture usually means another tab or app holds the camera
+let darkSince = 0;
+
+function checkDark() {
+    const probe = document.createElement("canvas");
+    probe.width = 32;
+    probe.height = 24;
+    const p = probe.getContext("2d");
+    p.drawImage(video, 0, 0, 32, 24);
+    const px = p.getImageData(0, 0, 32, 24).data;
+    let sum = 0;
+    for (let i = 0; i < px.length; i += 4) sum += px[i] + px[i + 1] + px[i + 2];
+    const dark = sum / (px.length / 4) / 3 < 8;
+    if (!dark) { darkSince = 0; $("warn").textContent = ""; return; }
+    if (!darkSince) darkSince = Date.now();
+    if (Date.now() - darkSince > 3000) {
+        $("warn").textContent =
+            "The camera picture is black. Close other tabs/apps that use the camera, then press Restart camera (or pick another camera).";
     }
 }
 
@@ -556,6 +699,10 @@ function drawLoop(mySession) {
     }
 
     if (video.readyState >= 2) {
+        if (video.videoWidth && (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight)) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+        }
         ctx.drawImage(
             video,
             0,
@@ -663,7 +810,7 @@ async function detectLoop(mySession) {
             capture.toBlob(
                 resolve,
                 "image/jpeg",
-                0.65
+                0.85
             );
         });
 
@@ -674,6 +821,9 @@ async function detectLoop(mySession) {
 
         const form = new FormData();
         form.append("image", blob, "frame.jpg");
+        form.append("conf", String($("sens").value / 100));
+
+        checkDark();
 
         try {
             $("status").textContent =
@@ -760,15 +910,7 @@ async function detectLoop(mySession) {
 
 function stopCamera() {
 
-    running = false;
-    session++;
-
-    if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-    }
-
-    video.srcObject = null;
+    stopStream();
 
     detections = [];
     roi = null;
@@ -855,7 +997,13 @@ def detect():
         }), 400
 
     try:
-        boxes, roi = detect_bottles(image)
+        conf = float(request.form.get("conf", CONF_THRESHOLD))
+    except ValueError:
+        conf = CONF_THRESHOLD
+    conf = min(MAX_CONF, max(MIN_CONF, conf))
+
+    try:
+        boxes, roi = detect_bottles(image, conf)
 
     except Exception:
         app.logger.exception("YOLO inference error")

@@ -1030,6 +1030,7 @@ window.addEventListener("pagehide", () => {
 });
 </script>
 
+<div style="position:fixed;bottom:8px;left:8px;z-index:9999;padding:4px 10px;border-radius:999px;background:rgba(15,23,42,.75);color:#fff;font:600 12px/1.4 Arial,sans-serif;pointer-events:none">&copy; Abed Mihilia</div>
 </body>
 </html>
 """
